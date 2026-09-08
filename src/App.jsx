@@ -4,6 +4,7 @@ import PrototypeBanner from './components/PrototypeBanner';
 import AdminConsole from './pages/AdminConsole';
 import StudentPortal from './pages/StudentPortal';
 import VerificationUI from './pages/VerificationUI';
+import PublicProfile from './pages/PublicProfile';
 import { AuthProvider } from './context/AuthContext';
 import { ToastProvider } from './context/ToastContext';
 
@@ -19,6 +20,7 @@ export default function App() {
               <Route path="/admin" element={<AdminConsole />} />
               <Route path="/student" element={<StudentPortal />} />
               <Route path="/verify" element={<VerificationUI />} />
+              <Route path="/profile/:studentId" element={<PublicProfile />} />
               <Route path="*" element={<Navigate to="/verify" replace />} />
             </Routes>
           </main>

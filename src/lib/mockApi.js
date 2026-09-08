@@ -8,6 +8,7 @@
 // Verification screen produces a real hash match against this mock store.
 
 import { buildCertificateBytes, computeSha256Hex } from './generateCertificatePdf';
+import { REFERENCE_INSTITUTION } from './institution';
 
 const HEX = '0123456789abcdef';
 
@@ -17,11 +18,16 @@ function randomHex(len) {
   return out;
 }
 
-function fakeTxHash() {
+// Exported so the Admin issuance UI can generate a candidate credential ID
+// and ledger reference up front for its review-before-issuing step, then
+// pass those same values through to issueCredential() below — guaranteeing
+// the certificate bytes (and therefore the SHA-256 hash) shown in the
+// preview are byte-for-byte identical to what actually gets issued.
+export function fakeTxHash() {
   return '0x' + randomHex(64);
 }
 
-function fakeCredentialId() {
+export function fakeCredentialId() {
   const year = new Date().getFullYear();
   return `COR-${year}-${randomHex(6).toUpperCase()}`;
 }
@@ -31,7 +37,7 @@ function delay(min = 600, max = 1200) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const ISSUER_NAME = 'Rajiv Gandhi Institute of Technology';
+const ISSUER_NAME = REFERENCE_INSTITUTION.name;
 
 // ---- seed data (hashes are computed for real at first load, see ensureReady) ----
 
@@ -132,7 +138,12 @@ const seedCredentials = [
   },
 ];
 
-const STORAGE_KEY = 'cor-mock-credentials-v2';
+// Bumped from v2: the reference institution changed (Rajiv Gandhi Institute
+// of Technology -> Alliance University). Since the issuer name is part of
+// the hashed certificate content, any browser with an old cached store must
+// reseed rather than keep serving stale records under the old institution
+// (and their now-inapplicable hashes).
+const STORAGE_KEY = 'cor-mock-credentials-v3';
 
 // The "logged in" demo student — used by the Student Portal.
 export const DEMO_STUDENT_ID = 'RGIT21CS014';
@@ -182,14 +193,29 @@ async function ensureReady() {
 
 // ---- API ---------------------------------------------------------------
 
-export async function issueCredential({ studentName, studentId, credentialType, issueDate }) {
+/**
+ * `credentialId` and `txHash` are optional overrides — when omitted (the
+ * original behavior, used by every existing caller), fresh random values
+ * are generated exactly as before. The Admin issuance review step passes
+ * in the same values it already used to compute a preview hash, so the
+ * confirmed record's hash matches that preview exactly rather than being
+ * silently recomputed against a second, different random ID.
+ */
+export async function issueCredential({
+  studentName,
+  studentId,
+  credentialType,
+  issueDate,
+  credentialId: providedCredentialId,
+  txHash: providedTxHash,
+}) {
   await ensureReady();
 
   // Step 1: simulate PDF generation
   await delay(500, 800);
 
-  const txHash = fakeTxHash();
-  const credentialId = fakeCredentialId();
+  const txHash = providedTxHash || fakeTxHash();
+  const credentialId = providedCredentialId || fakeCredentialId();
   const fields = {
     credentialId,
     studentName,

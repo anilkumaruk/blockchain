@@ -1,44 +1,61 @@
 import { useEffect, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import {
   QrCode,
   Hash,
   Upload,
-  ScanLine,
-  ImageUp,
   Search,
-  CheckCircle2,
-  XCircle,
-  AlertTriangle,
   ChevronDown,
   FileText,
-  Building2,
-  CalendarDays,
-  Link2,
-  BadgeCheck,
-  Ban,
   X,
+  ShieldCheck,
+  Fingerprint,
+  Database,
+  ScanEye,
+  ArrowRight,
+  UserSearch,
+  ExternalLink,
+  Sparkles,
 } from 'lucide-react';
 import { useToast } from '../context/ToastContext';
 import Spinner from '../components/Spinner';
 import HashChip from '../components/HashChip';
+import VerificationResult from '../components/VerificationResult';
+import VerificationHistory, {
+  loadVerificationHistory,
+  pushVerificationHistory,
+  clearVerificationHistory,
+} from '../components/VerificationHistory';
+import QrScanTab from '../components/QrScanTab';
 import { verifyCredential, getAllCredentials } from '../lib/mockApi';
+import { resolveVerificationState } from '../lib/verification';
 
 const TABS = [
-  { key: 'scan', label: 'Scan QR', icon: QrCode },
-  { key: 'id', label: 'Enter Credential ID', icon: Hash },
+  { key: 'id', label: 'Credential ID', icon: Hash },
   { key: 'upload', label: 'Upload Certificate', icon: Upload },
+  { key: 'qr', label: 'Scan QR Code', icon: QrCode },
+  { key: 'profile', label: 'Candidate Profile', icon: UserSearch },
 ];
 
 export default function VerificationUI() {
   const { notify } = useToast();
   const [searchParams] = useSearchParams();
   const [tab, setTab] = useState('id');
-  const [result, setResult] = useState(null); // { status, details }
+  const [idValue, setIdValue] = useState('');
+  const [result, setResult] = useState(null);
   const [verifying, setVerifying] = useState(false);
-  const [lastQuery, setLastQuery] = useState(null); // { type: 'id'|'hash', value }
+  const [lastQuery, setLastQuery] = useState(null);
+  const [verifiedAt, setVerifiedAt] = useState(null);
+  const [lastVerifiedCredential, setLastVerifiedCredential] = useState(null);
+  const [history, setHistory] = useState(() => loadVerificationHistory());
+  const idInputRef = useRef(null);
+  const autoVerifiedRef = useRef(false);
 
   const prefilledId = searchParams.get('credentialId');
+
+  useEffect(() => {
+    if (prefilledId) setIdValue(prefilledId);
+  }, [prefilledId]);
 
   const runVerify = async (payload, query) => {
     setVerifying(true);
@@ -47,23 +64,73 @@ export default function VerificationUI() {
     try {
       const res = await verifyCredential(payload);
       setResult(res);
+      setVerifiedAt(new Date());
+      const state = resolveVerificationState(res.status, query.type);
+
+      if (state === 'verified' || state === 'revoked') {
+        setLastVerifiedCredential(res.details);
+      }
+
+      const label =
+        state === 'not_found'
+          ? `ID: ${res.details.submittedId}`
+          : state === 'mismatch'
+          ? query.fileName || 'Uploaded file'
+          : `${res.details.studentName} — ${res.details.credentialType}`;
+
+      setHistory(
+        pushVerificationHistory({
+          result: state,
+          label,
+          credentialId: state === 'verified' || state === 'revoked' ? res.details.credentialId : null,
+        })
+      );
+
       if (res.status === 'valid') notify('Credential verified as valid.', 'success');
       else if (res.status === 'revoked') notify('Credential found but has been revoked.', 'warning');
-      else notify('Verification failed — no match found.', 'error');
+      else if (state === 'mismatch') notify('Document fingerprint does not match.', 'error');
+      else notify('No matching credential found.', 'error');
     } finally {
       setVerifying(false);
     }
   };
 
+  // Arriving from a Public Profile's "Verify credential" link should feel
+  // instant — the ID is already known, so there's no reason to make the
+  // recruiter click Verify again.
+  useEffect(() => {
+    if (prefilledId && !autoVerifiedRef.current) {
+      autoVerifiedRef.current = true;
+      runVerify({ credentialId: prefilledId }, { type: 'id', value: prefilledId });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefilledId]);
+
+  const handlePickId = (id) => {
+    setIdValue(id);
+    setTab('id');
+    setResult(null);
+    idInputRef.current?.focus();
+  };
+
+  const handleClearHistory = () => {
+    clearVerificationHistory();
+    setHistory([]);
+  };
+
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-5 py-8">
-      <div className="mb-6">
-        <h1 className="text-xl font-semibold">Verify a Credential</h1>
-        <p className="text-sm text-ink-soft mt-0.5">
-          Confirm the authenticity of an academic credential against the on-chain record — by
-          QR code, credential ID, or the certificate file itself.
-        </p>
-      </div>
+      <Hero
+        onVerifyCredential={() => {
+          setTab('id');
+          setTimeout(() => idInputRef.current?.focus(), 0);
+        }}
+        onVerifyCandidate={() => setTab('profile')}
+      />
+
+      <p className="text-xs font-semibold text-ink-soft uppercase tracking-wide mb-2">
+        Choose how to verify
+      </p>
 
       <div className="bg-card border border-border rounded-lg card-shadow overflow-hidden">
         <div className="flex border-b border-border">
@@ -87,125 +154,123 @@ export default function VerificationUI() {
         </div>
 
         <div className="p-6">
-          {tab === 'scan' && <ScanTab onVerify={runVerify} verifying={verifying} />}
           {tab === 'id' && (
-            <IdTab onVerify={runVerify} verifying={verifying} prefilledId={prefilledId} />
+            <IdTab
+              value={idValue}
+              onChange={setIdValue}
+              onSubmit={() =>
+                idValue.trim() &&
+                runVerify({ credentialId: idValue.trim() }, { type: 'id', value: idValue.trim() })
+              }
+              verifying={verifying}
+              inputRef={idInputRef}
+            />
           )}
           {tab === 'upload' && <UploadTab onVerify={runVerify} verifying={verifying} />}
+          {tab === 'qr' && <QrScanTab onFallback={() => setTab('profile')} />}
+          {tab === 'profile' && <ProfileTab />}
         </div>
       </div>
 
       <div className="mt-5">
         {verifying && <VerifyingCard />}
-        {!verifying && result && <ResultCard result={result} query={lastQuery} />}
+        {!verifying && result && (
+          <VerificationResult
+            result={result}
+            queryType={lastQuery?.type}
+            verifiedAt={verifiedAt}
+            referenceCredential={lastVerifiedCredential}
+          />
+        )}
       </div>
+
+      <QuickDemo onPick={handlePickId} />
+
+      <VerificationHistory entries={history} onSelect={handlePickId} onClear={handleClearHistory} />
 
       <ExplainerCollapsible />
     </div>
   );
 }
 
-// ---- Scan QR tab ---------------------------------------------------------
+// ---- Hero -------------------------------------------------------------------
 
-function ScanTab({ onVerify, verifying }) {
-  const [scanning, setScanning] = useState(false);
-  const [demoId, setDemoId] = useState(null);
-  const fileInputRef = useRef(null);
-
-  useEffect(() => {
-    getAllCredentials().then((list) => {
-      const valid = list.find((c) => c.status === 'valid');
-      if (valid) setDemoId(valid.credentialId);
-    });
-  }, []);
-
-  const simulateScan = (source) => {
-    setScanning(true);
-    setTimeout(() => {
-      setScanning(false);
-      const id = demoId || 'COR-2023-9F3A1C';
-      onVerify({ credentialId: id }, { type: 'id', value: id, via: source });
-    }, 1400);
-  };
-
+function Hero({ onVerifyCredential, onVerifyCandidate }) {
   return (
-    <div className="flex flex-col items-center">
-      <div className="relative w-56 h-56 rounded-xl bg-ink flex items-center justify-center overflow-hidden mb-5">
-        {/* corner brackets */}
-        {['top-3 left-3 border-t-2 border-l-2', 'top-3 right-3 border-t-2 border-r-2', 'bottom-3 left-3 border-b-2 border-l-2', 'bottom-3 right-3 border-b-2 border-r-2'].map(
-          (pos, i) => (
-            <span key={i} className={`absolute w-6 h-6 border-teal/70 ${pos}`} />
-          )
-        )}
-        {scanning ? (
-          <span className="absolute left-3 right-3 h-0.5 bg-teal shadow-[0_0_8px_2px_rgba(46,85,104,0.7)] animate-scan-line" />
-        ) : (
-          <QrCode size={40} className="text-white/25" />
-        )}
-        <p className="absolute bottom-2 left-0 right-0 text-center text-[10px] text-white/50">
-          {scanning ? 'Scanning…' : 'Camera preview (simulated)'}
-        </p>
-      </div>
-
-      <p className="text-xs text-ink-soft mb-4 text-center max-w-xs">
-        Point a camera at the credential's QR code. This prototype simulates the camera feed —
-        press below to simulate a successful scan.
+    <div className="mb-7">
+      <p className="text-[11px] font-semibold tracking-[0.14em] text-teal uppercase mb-2">
+        Employer verification
+      </p>
+      <h1 className="text-2xl sm:text-3xl font-semibold leading-tight mb-2">
+        Verify Academic Credentials
+      </h1>
+      <p className="text-sm text-ink-soft max-w-xl mb-1.5">
+        Confirm that a credential was issued by the institution, has not been revoked, and matches
+        its registered digital fingerprint.
+      </p>
+      <p className="text-xs text-ink-soft/70 italic mb-5">
+        Don't trust the PDF. Verify the credential behind it.
       </p>
 
-      <div className="flex flex-col sm:flex-row gap-2 w-full max-w-xs">
+      <div className="flex items-center gap-1.5 mb-5 text-xs font-medium">
+        <Pill>Verify</Pill>
+        <ArrowRight size={11} className="text-ink-soft" aria-hidden="true" />
+        <Pill>Authenticate</Pill>
+        <ArrowRight size={11} className="text-ink-soft" aria-hidden="true" />
+        <Pill accent>Trust</Pill>
+      </div>
+
+      <div className="flex flex-wrap gap-2">
         <button
-          onClick={() => simulateScan('camera')}
-          disabled={verifying || scanning}
-          className="flex-1 flex items-center justify-center gap-1.5 bg-teal text-white text-sm font-medium rounded-md px-4 py-2.5 hover:bg-teal/90 disabled:opacity-60"
+          onClick={onVerifyCredential}
+          className="flex items-center gap-1.5 bg-teal text-white text-sm font-medium rounded-md px-4 py-2.5 hover:bg-teal/90"
         >
-          {scanning ? <Spinner size={14} /> : <ScanLine size={15} />}
-          {scanning ? 'Scanning…' : 'Simulate scan'}
+          <Search size={15} aria-hidden="true" />
+          Verify Credential
         </button>
         <button
-          onClick={() => fileInputRef.current?.click()}
-          disabled={verifying || scanning}
-          className="flex-1 flex items-center justify-center gap-1.5 border border-border text-sm font-medium rounded-md px-4 py-2.5 hover:bg-bg disabled:opacity-60"
+          onClick={onVerifyCandidate}
+          className="flex items-center gap-1.5 border border-border text-sm font-medium rounded-md px-4 py-2.5 hover:bg-bg"
         >
-          <ImageUp size={15} />
-          Upload QR image
+          <UserSearch size={15} aria-hidden="true" />
+          Verify Candidate
         </button>
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept="image/*"
-          className="hidden"
-          onChange={(e) => {
-            if (e.target.files?.[0]) simulateScan('image upload');
-            e.target.value = '';
-          }}
-        />
       </div>
     </div>
   );
 }
 
-// ---- Enter ID tab ---------------------------------------------------------
+function Pill({ children, accent }) {
+  return (
+    <span
+      className={`px-2.5 py-1 rounded-full border ${
+        accent ? 'bg-teal text-white border-teal' : 'bg-bg border-border text-ink-soft'
+      }`}
+    >
+      {children}
+    </span>
+  );
+}
 
-function IdTab({ onVerify, verifying, prefilledId }) {
-  const [value, setValue] = useState(prefilledId || '');
+// ---- Credential ID tab --------------------------------------------------------
 
-  useEffect(() => {
-    if (prefilledId) setValue(prefilledId);
-  }, [prefilledId]);
-
+function IdTab({ value, onChange, onSubmit, verifying, inputRef }) {
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (!value.trim()) return;
-    onVerify({ credentialId: value.trim() }, { type: 'id', value: value.trim() });
+    onSubmit();
   };
 
   return (
     <form onSubmit={handleSubmit}>
-      <label className="block text-xs font-medium text-ink-soft mb-1.5">Credential ID</label>
+      <label htmlFor="verifier-credential-id" className="block text-xs font-medium text-ink-soft mb-1.5">
+        Credential ID
+      </label>
       <div className="flex gap-2">
         <input
+          id="verifier-credential-id"
+          ref={inputRef}
           value={value}
-          onChange={(e) => setValue(e.target.value)}
+          onChange={(e) => onChange(e.target.value)}
           placeholder="e.g. COR-2023-9F3A1C"
           className="flex-1 rounded-md border border-border bg-white px-3 py-2.5 text-sm font-mono outline-none focus:ring-2 focus:ring-teal/30 focus:border-teal"
         />
@@ -215,23 +280,9 @@ function IdTab({ onVerify, verifying, prefilledId }) {
           className="flex items-center gap-1.5 bg-teal text-white text-sm font-medium rounded-md px-4 py-2.5 hover:bg-teal/90 disabled:opacity-50 shrink-0"
         >
           {verifying ? <Spinner size={14} /> : <Search size={15} />}
-          Verify
+          Verify Credential
         </button>
       </div>
-      <p className="text-xs text-ink-soft mt-3">
-        Try:{' '}
-        {['COR-2023-9F3A1C', 'COR-2023-4B7E22', 'COR-9999-000000'].map((id, i) => (
-          <button
-            type="button"
-            key={id}
-            onClick={() => setValue(id)}
-            className="font-mono text-teal hover:underline mr-2"
-          >
-            {id}
-            {i < 2 ? ',' : ''}
-          </button>
-        ))}
-      </p>
     </form>
   );
 }
@@ -279,6 +330,16 @@ function UploadTab({ onVerify, verifying }) {
 
   return (
     <div>
+      <p className="flex flex-wrap items-center gap-1.5 text-[11px] text-ink-soft mb-4">
+        <span>Upload</span>
+        <ArrowRight size={10} aria-hidden="true" />
+        <span>Calculate SHA-256</span>
+        <ArrowRight size={10} aria-hidden="true" />
+        <span>Compare with registered Credential DNA</span>
+        <ArrowRight size={10} aria-hidden="true" />
+        <span>Return result</span>
+      </p>
+
       {!file ? (
         <div
           onDragOver={(e) => {
@@ -348,7 +409,7 @@ function UploadTab({ onVerify, verifying }) {
             className="w-full flex items-center justify-center gap-1.5 bg-teal text-white text-sm font-medium rounded-md px-4 py-2.5 hover:bg-teal/90 disabled:opacity-50"
           >
             {verifying ? <Spinner size={14} /> : <Search size={15} />}
-            Compare against blockchain record
+            Compare against registered credential fingerprint
           </button>
         </div>
       )}
@@ -356,129 +417,141 @@ function UploadTab({ onVerify, verifying }) {
   );
 }
 
-// ---- Result & supporting UI ------------------------------------------------
+// ---- Candidate profile tab -----------------------------------------------
+
+function ProfileTab() {
+  const navigate = useNavigate();
+  const [value, setValue] = useState('');
+
+  const extractId = (input) => {
+    const trimmed = input.trim();
+    const match = trimmed.match(/\/profile\/([^/?#]+)/);
+    return match ? decodeURIComponent(match[1]) : trimmed;
+  };
+
+  const handleOpen = (e) => {
+    e.preventDefault();
+    const id = extractId(value);
+    if (!id) return;
+    navigate(`/profile/${encodeURIComponent(id)}`);
+  };
+
+  return (
+    <div>
+      <p className="text-sm text-ink-soft mb-4">
+        Open a candidate's Verified Professional Passport to see their academic credentials, then
+        verify any of them individually from there.
+      </p>
+      <form onSubmit={handleOpen} className="flex gap-2 mb-3">
+        <label htmlFor="verifier-profile-link" className="sr-only">
+          Candidate profile link or student ID
+        </label>
+        <input
+          id="verifier-profile-link"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          placeholder="Paste a profile link or enter a student ID"
+          className="flex-1 rounded-md border border-border bg-white px-3 py-2.5 text-sm outline-none focus:ring-2 focus:ring-teal/30 focus:border-teal"
+        />
+        <button
+          type="submit"
+          disabled={!value.trim()}
+          className="flex items-center gap-1.5 bg-teal text-white text-sm font-medium rounded-md px-4 py-2.5 hover:bg-teal/90 disabled:opacity-50 shrink-0"
+        >
+          <ExternalLink size={15} aria-hidden="true" />
+          Open candidate profile
+        </button>
+      </form>
+      <p className="text-[11px] text-ink-soft">
+        Camera-based QR scanning is planned for a future release. For now, open the link a
+        candidate shares, or the one their passport's QR code points to.
+      </p>
+    </div>
+  );
+}
+
+// ---- Quick demo -------------------------------------------------------------
+
+function QuickDemo({ onPick }) {
+  const [samples, setSamples] = useState([]);
+
+  useEffect(() => {
+    getAllCredentials().then((list) => {
+      const valid = list.find((c) => c.status === 'valid');
+      const revoked = list.find((c) => c.status === 'revoked');
+      setSamples([valid, revoked].filter(Boolean));
+    });
+  }, []);
+
+  if (samples.length === 0) return null;
+
+  return (
+    <div className="mt-6 border border-border rounded-lg bg-card p-4">
+      <p className="text-xs font-semibold text-ink-soft uppercase tracking-wide mb-1 flex items-center gap-1.5">
+        <Sparkles size={12} aria-hidden="true" />
+        Try a verification
+      </p>
+      <p className="text-xs text-ink-soft mb-3">
+        Populate the Credential ID field with a real credential from this prototype's records.
+      </p>
+      <div className="flex flex-wrap gap-2">
+        {samples.map((c) => (
+          <button
+            key={c.credentialId}
+            onClick={() => onPick(c.credentialId)}
+            className="flex items-center gap-1.5 text-xs font-mono border border-border rounded-md px-2.5 py-1.5 hover:bg-bg"
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${c.status === 'valid' ? 'bg-valid' : 'bg-revoked'}`}
+              aria-hidden="true"
+            />
+            {c.credentialId}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---- Verifying state ------------------------------------------------------
 
 function VerifyingCard() {
   return (
     <div className="bg-card border border-border rounded-lg card-shadow p-6 flex items-center gap-3">
       <Spinner size={18} className="text-teal" />
-      <p className="text-sm text-ink-soft">Checking the on-chain record…</p>
+      <p className="text-sm text-ink-soft">Checking the registered credential record…</p>
     </div>
   );
 }
 
-const RESULT_CONFIG = {
-  valid: {
-    icon: CheckCircle2,
-    title: 'Valid credential',
-    bg: 'bg-valid-soft',
-    border: 'border-valid/30',
-    text: 'text-valid',
+// ---- How verification works ------------------------------------------------
+
+const HOW_STEPS = [
+  {
+    n: '01',
+    title: 'Issue',
+    icon: FileText,
+    body: 'The institution creates the credential and generates its certificate.',
   },
-  invalid: {
-    icon: XCircle,
-    title: 'Invalid credential',
-    bg: 'bg-invalid-soft',
-    border: 'border-invalid/30',
-    text: 'text-invalid',
+  {
+    n: '02',
+    title: 'Fingerprint',
+    icon: Fingerprint,
+    body: 'The certificate receives a SHA-256 Credential DNA — a unique fingerprint of its exact bytes.',
   },
-  revoked: {
-    icon: AlertTriangle,
-    title: 'Credential revoked',
-    bg: 'bg-revoked-soft',
-    border: 'border-revoked/30',
-    text: 'text-revoked',
+  {
+    n: '03',
+    title: 'Register',
+    icon: Database,
+    body: 'The credential record stores that fingerprint alongside the credential details.',
   },
-};
-
-function ResultCard({ result, query }) {
-  const cfg = RESULT_CONFIG[result.status];
-  const Icon = cfg.icon;
-  const d = result.details;
-
-  return (
-    <div className={`rounded-lg border card-shadow p-6 ${cfg.bg} ${cfg.border}`}>
-      <div className="flex items-start gap-3 mb-4">
-        <span className={`w-10 h-10 rounded-full bg-white flex items-center justify-center shrink-0 ${cfg.text}`}>
-          <Icon size={20} />
-        </span>
-        <div>
-          <h3 className={`text-base font-semibold ${cfg.text}`}>{cfg.title}</h3>
-          <p className="text-sm text-ink-soft mt-0.5">
-            {result.status === 'valid' &&
-              'This credential matches an active record on-chain and has not been revoked.'}
-            {result.status === 'revoked' &&
-              'This credential was issued but has since been revoked by the issuing institution.'}
-            {result.status === 'invalid' && d.reason}
-          </p>
-        </div>
-      </div>
-
-      {result.status === 'valid' && (
-        <div className="bg-white rounded-md border border-border p-4 space-y-3">
-          <DetailRow icon={BadgeCheck} label="Credential type" value={d.credentialType} />
-          <DetailRow icon={Building2} label="Issuer" value={d.issuer} />
-          <DetailRow icon={CalendarDays} label="Issue date" value={d.issueDate} />
-          <DetailRow icon={Hash} label="Credential ID" value={d.credentialId} mono />
-          <div className="pt-1">
-            <HashChip label="Tx reference" value={d.txHash} />
-          </div>
-        </div>
-      )}
-
-      {result.status === 'revoked' && (
-        <div className="bg-white rounded-md border border-border p-4 space-y-3">
-          <DetailRow icon={BadgeCheck} label="Credential type" value={d.credentialType} />
-          <DetailRow icon={Building2} label="Issuer" value={d.issuer} />
-          <DetailRow icon={CalendarDays} label="Original issue date" value={d.issueDate} />
-          <DetailRow icon={Hash} label="Credential ID" value={d.credentialId} mono />
-          <div className="border-t border-border pt-3 space-y-2">
-            <DetailRow
-              icon={Ban}
-              label="Revocation date"
-              value={d.revocation?.date}
-              accent="text-revoked"
-            />
-            <div>
-              <p className="text-xs text-ink-soft mb-0.5 flex items-center gap-1.5">
-                <Link2 size={13} /> Revocation reason
-              </p>
-              <p className="text-sm text-ink pl-[19px]">{d.revocation?.reason}</p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {result.status === 'invalid' && (
-        <div className="bg-white rounded-md border border-border p-4 space-y-2 text-sm">
-          {query?.type === 'id' && (
-            <p className="text-ink-soft">
-              Submitted ID: <span className="font-mono text-ink">{d.submittedId}</span>
-            </p>
-          )}
-          {query?.type === 'hash' && (
-            <p className="text-ink-soft break-all">
-              Computed hash: <span className="font-mono text-ink">{d.submittedHash}</span>
-              {query.fileName && <span className="block mt-0.5">from file "{query.fileName}"</span>}
-            </p>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function DetailRow({ icon: Icon, label, value, mono, accent }) {
-  return (
-    <div className="flex items-center gap-2">
-      <Icon size={14} className="text-ink-soft shrink-0" />
-      <span className="text-xs text-ink-soft w-32 shrink-0">{label}</span>
-      <span className={`text-sm ${mono ? 'font-mono' : 'font-medium'} ${accent || 'text-ink'}`}>
-        {value}
-      </span>
-    </div>
-  );
-}
+  {
+    n: '04',
+    title: 'Verify',
+    icon: ScanEye,
+    body: 'The submitted document is hashed again and compared against the registered fingerprint.',
+  },
+];
 
 function ExplainerCollapsible() {
   const [open, setOpen] = useState(false);
@@ -487,51 +560,38 @@ function ExplainerCollapsible() {
       <button
         onClick={() => setOpen((o) => !o)}
         className="w-full flex items-center justify-between px-5 py-3.5 text-left"
+        aria-expanded={open}
       >
-        <span className="text-sm font-medium">How verification works</span>
+        <span className="text-sm font-medium flex items-center gap-1.5">
+          <ShieldCheck size={15} className="text-teal" aria-hidden="true" />
+          How verification works
+        </span>
         <ChevronDown
           size={16}
           className={`text-ink-soft transition-transform ${open ? 'rotate-180' : ''}`}
+          aria-hidden="true"
         />
       </button>
       {open && (
-        <div className="px-5 pb-5 text-sm text-ink-soft space-y-3 border-t border-border pt-4">
-          <Step
-            n={1}
-            title="A certificate PDF is generated"
-            body="When the institution issues a credential, a PDF certificate is generated containing the student and credential details."
-          />
-          <Step
-            n={2}
-            title="Its SHA-256 hash is computed"
-            body="A cryptographic hash (a fixed-length fingerprint) of the document is calculated. Even a single changed character produces a completely different hash."
-          />
-          <Step
-            n={3}
-            title="Only the hash is written on-chain"
-            body="The hash — never the PDF itself — is recorded in a smart-contract transaction, alongside the credential ID. This keeps documents private while making tampering detectable."
-          />
-          <Step
-            n={4}
-            title="Verifiers recompute and compare"
-            body="Anyone can hash their own copy of the certificate and compare it against the on-chain hash. A match proves the document is authentic and unaltered."
-          />
+        <div className="px-5 pb-5 border-t border-border pt-5">
+          <div className="grid sm:grid-cols-4 gap-4 mb-5">
+            {HOW_STEPS.map(({ n, title, icon: Icon, body }) => (
+              <div key={n} className="text-center sm:text-left">
+                <div className="flex items-center gap-2 justify-center sm:justify-start mb-1.5">
+                  <span className="text-xs font-semibold text-teal">{n}</span>
+                  <Icon size={14} className="text-teal" aria-hidden="true" />
+                </div>
+                <p className="text-sm font-medium text-ink mb-1">{title}</p>
+                <p className="text-xs text-ink-soft leading-snug">{body}</p>
+              </div>
+            ))}
+          </div>
+          <p className="text-[11px] text-ink-soft bg-bg border border-border rounded-md px-3 py-2.5">
+            Current prototype: credential records and blockchain anchoring are simulated. SHA-256
+            document fingerprinting is performed locally, for real, in your browser.
+          </p>
         </div>
       )}
-    </div>
-  );
-}
-
-function Step({ n, title, body }) {
-  return (
-    <div className="flex gap-3">
-      <span className="w-5 h-5 rounded-full bg-teal-soft text-teal text-xs font-semibold flex items-center justify-center shrink-0 mt-0.5">
-        {n}
-      </span>
-      <div>
-        <p className="text-ink font-medium text-sm">{title}</p>
-        <p className="text-ink-soft text-sm mt-0.5">{body}</p>
-      </div>
     </div>
   );
 }

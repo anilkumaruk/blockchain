@@ -109,3 +109,141 @@ export function downloadCertificatePdf(credential) {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
 }
+
+/**
+ * Builds a one-page "Verified Professional Passport" resume PDF summarizing
+ * every credential on a student's profile, using the same hand-rolled PDF
+ * writer as the certificate generator. Purely a client-side re-presentation
+ * of data already in the mock store — no new facts (CGPA, skills, projects,
+ * work experience, etc.) are introduced, since none of those exist in the
+ * current credential data model.
+ *
+ * `profileUrl` is printed as plain text rather than a scannable QR code —
+ * see the note on downloadVerifiedResumePdf() for why.
+ */
+export function buildResumeBytes(profile, credentials, profileUrl) {
+  const lines = [
+    { text: 'CHAIN OF RECORD', size: 9, gap: 16, color: [0.34, 0.41, 0.44] },
+    { text: 'Verified Professional Passport', size: 19, gap: 32, color: [0.18, 0.33, 0.41] },
+    { text: profile.studentName || 'Unknown student', size: 15, gap: 22 },
+    { text: profile.primaryProgram || '', size: 11, gap: 18 },
+    { text: profile.primaryInstitution || '', size: 10, gap: 18, color: [0.34, 0.41, 0.44] },
+    { text: `Student ID: ${profile.studentId}`, size: 9, gap: 14, color: [0.34, 0.41, 0.44] },
+  ];
+
+  if (profile.latestIssueYear) {
+    lines.push({
+      text: `Class of ${profile.latestIssueYear}`,
+      size: 9,
+      gap: 26,
+      color: [0.34, 0.41, 0.44],
+    });
+  } else {
+    lines.push({ text: '', size: 9, gap: 14 });
+  }
+
+  lines.push({ text: 'VERIFIED ACADEMIC CREDENTIALS', size: 11, gap: 22 });
+
+  for (const c of credentials) {
+    lines.push({ text: c.credentialType, size: 10, gap: 14 });
+    lines.push({
+      text: `  ${c.issuer} — Issued: ${c.issueDate}`,
+      size: 8,
+      gap: 13,
+      color: [0.34, 0.41, 0.44],
+    });
+    lines.push({
+      text: `  Credential ID: ${c.credentialId} — Status: ${
+        c.status === 'revoked' ? 'Revoked' : 'Verified'
+      }`,
+      size: 8,
+      gap: 20,
+      color: [0.34, 0.41, 0.44],
+    });
+  }
+
+  lines.push({ text: 'VERIFICATION', size: 11, gap: 18 });
+  lines.push({
+    text: 'Credentials listed in this resume can be independently verified',
+    size: 8,
+    gap: 12,
+    color: [0.34, 0.41, 0.44],
+  });
+  lines.push({
+    text: 'through Chain of Record, using each Credential ID.',
+    size: 8,
+    gap: 22,
+    color: [0.34, 0.41, 0.44],
+  });
+
+  if (profileUrl) {
+    lines.push({
+      text: 'Verified profile:',
+      size: 8,
+      gap: 12,
+      color: [0.34, 0.41, 0.44],
+    });
+    lines.push({
+      text: profileUrl,
+      size: 8,
+      gap: 16,
+      color: [0.18, 0.33, 0.41],
+    });
+  }
+
+  const content = buildContentStream(lines);
+  const encoder = new TextEncoder();
+  const contentBytes = encoder.encode(content);
+
+  const objects = [];
+  objects.push('<< /Type /Catalog /Pages 2 0 R >>');
+  objects.push('<< /Type /Pages /Kids [3 0 R] /Count 1 >>');
+  objects.push(
+    '<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >>'
+  );
+  objects.push('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+  objects.push(`<< /Length ${contentBytes.length} >>\nstream\n${content}\nendstream`);
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+
+  objects.forEach((body, i) => {
+    offsets.push(encoder.encode(pdf).length);
+    pdf += `${i + 1} 0 obj\n${body}\nendobj\n`;
+  });
+
+  const xrefStart = encoder.encode(pdf).length;
+  let xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= objects.length; i++) {
+    xref += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += xref;
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+  return encoder.encode(pdf);
+}
+
+/**
+ * `profileUrl` (from studentProfile.js's buildProfileUrl) is printed as
+ * plain text on the resume rather than embedded as a scannable QR image.
+ * This PDF writer only supports simple text drawing (see
+ * buildContentStream) — it has no image/XObject or vector-fill support, and
+ * qrcode.react (used everywhere else in the app) only exposes DOM-rendering
+ * components, not a raw module matrix. Adding either would mean building a
+ * real QR encoder or an image-embedding PDF writer from scratch — a genuine
+ * rewrite of this generator, not a careful modification — so it's left as a
+ * documented limitation rather than attempted. The on-screen Share modal
+ * still provides a real, scannable QR for this same URL.
+ */
+export function downloadVerifiedResumePdf(profile, credentials, profileUrl) {
+  const bytes = buildResumeBytes(profile, credentials, profileUrl);
+  const blob = new Blob([bytes], { type: 'application/pdf' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${profile.studentId}-verified-resume.pdf`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
