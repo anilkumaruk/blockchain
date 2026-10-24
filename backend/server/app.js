@@ -117,8 +117,9 @@ export function createApp({
   // Records issued before multi-institution support belong to the root.
   const institutionOf = async (record) =>
     record.institutionId ? store.getInstitution(record.institutionId) : institutions.root();
-  const mayManage = (req, record, actor) =>
-    req.user.role === 'admin' ? !record.institutionId || record.institutionId === actor.id : record.institutionId === actor.id;
+  // A university manages only its own credentials.
+  const mayManage = (_req, record, actor) =>
+    (record.institutionId ?? institutions.rootId) === actor.id;
 
   // ---- issuance helpers ----------------------------------------------------
 
@@ -531,9 +532,10 @@ export function createApp({
 
   // ---- routes: admin ----------------------------------------------------------
 
+  // Platform admin: approves institutions, registry controls, audit log.
   const admin = auth.requireRole('admin');
-  // Registrars of the platform owner ('admin') and of approved institutions.
-  const issuer = auth.requireRole('admin', 'institution');
+  // University registrars: issue, revoke and list their own credentials.
+  const issuer = auth.requireRole('institution');
 
   app.post(
     '/api/credentials',
@@ -630,12 +632,11 @@ export function createApp({
     })
   );
 
-  // The platform admin sees every credential; an institution sees its own.
+  // Each university sees only its own credentials.
   app.get(
     '/api/credentials',
     ...issuer,
     asyncRoute(async (req, res) => {
-      if (req.user.role === 'admin') return res.json(await store.listAll());
       const inst = await actingInstitution(req);
       res.json(await store.listByInstitution(inst.id));
     })
@@ -702,7 +703,13 @@ export function createApp({
     ...admin,
     asyncRoute(async (_req, res) => {
       await institutions.root();
-      res.json((await store.listInstitutions()).map(institutions.publicView));
+      const counts = await store.countCredentialsByInstitution();
+      res.json(
+        (await store.listInstitutions()).map((i) => ({
+          ...institutions.publicView(i),
+          credentialCount: counts[i.id] ?? 0,
+        }))
+      );
     })
   );
 

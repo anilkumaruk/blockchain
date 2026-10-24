@@ -109,6 +109,11 @@ export function createMemoryStore() {
     async listByInstitution(institutionId) {
       return [...rows.values()].filter((r) => r.institutionId === institutionId).reverse().map(copy);
     },
+    async countCredentialsByInstitution() {
+      const out = {};
+      for (const r of rows.values()) if (r.institutionId) out[r.institutionId] = (out[r.institutionId] ?? 0) + 1;
+      return out;
+    },
 
     async getUser(username) {
       return copy(users.get(username));
@@ -350,6 +355,12 @@ export async function createPgStore(connectionString, { ssl } = {}) {
     listAll: () => many('SELECT * FROM credentials ORDER BY created_at DESC'),
     listByInstitution: (iid) =>
       many('SELECT * FROM credentials WHERE institution_id = $1 ORDER BY created_at DESC', [iid]),
+    async countCredentialsByInstitution() {
+      const { rows } = await query(
+        'SELECT institution_id, count(*)::int AS n FROM credentials WHERE institution_id IS NOT NULL GROUP BY 1'
+      );
+      return Object.fromEntries(rows.map((r) => [r.institution_id, r.n]));
+    },
 
     async getUser(username) {
       return userFromRow((await query('SELECT * FROM users WHERE username = $1', [username])).rows[0]);

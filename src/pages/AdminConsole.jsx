@@ -30,7 +30,6 @@ import {
   ArrowRight,
   Layers,
   ShieldHalf,
-  Building2,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
@@ -40,7 +39,7 @@ import CredentialDNA, { shortenHash } from '../components/CredentialDNA';
 import VerificationProofModal from '../components/VerificationProofModal';
 import BatchIssuePanel from '../components/BatchIssuePanel';
 import SecurityPanel from '../components/SecurityPanel';
-import InstitutionsPanel from '../components/InstitutionsPanel';
+import PlatformConsole from '../components/PlatformConsole';
 import {
   issueCredential,
   getAllCredentials,
@@ -64,9 +63,22 @@ const CREDENTIAL_TYPES = [
 ];
 
 export default function AdminConsole() {
-  const { adminAuthed } = useAuth();
-  const restored = ['admin', 'institution'].includes(getSession()?.role);
-  return adminAuthed || restored ? <AdminDashboard /> : <AdminLogin />;
+  const { adminAuthed, setAdminAuthed } = useAuth();
+  const role = getSession()?.role;
+  const restored = ['admin', 'institution'].includes(role);
+  if (!adminAuthed && !restored) return <AdminLogin />;
+  // The platform admin approves institutions; universities manage their own credentials.
+  if (USE_BACKEND && role === 'admin') {
+    return (
+      <PlatformConsole
+        onSignOut={() => {
+          adminLogout();
+          setAdminAuthed(false);
+        }}
+      />
+    );
+  }
+  return <AdminDashboard />;
 }
 
 // ---- Login -----------------------------------------------------------------
@@ -119,7 +131,7 @@ function AdminLogin() {
           <form onSubmit={handleSubmit} className="space-y-3.5">
             <div>
               <label className="block text-xs font-medium text-ink-soft mb-1.5">
-                {USE_BACKEND ? 'Email or username' : 'Registrar username'}
+                {USE_BACKEND ? 'Registrar email or platform admin username' : 'Registrar username'}
               </label>
               <input
                 value={username}
@@ -168,8 +180,8 @@ function AdminLogin() {
 
 function AdminDashboard() {
   const { setAdminAuthed } = useAuth();
-  // Approving institutions and the registry controls belong to the platform owner only.
-  const isPlatformAdmin = !USE_BACKEND || getSession()?.role === 'admin';
+  // Registry controls live in the platform console; in mock mode the demo shows them here.
+  const isPlatformAdmin = !USE_BACKEND;
   const [tab, setTab] = useState('issue');
   const [credentials, setCredentials] = useState([]);
   const [loadingList, setLoadingList] = useState(true);
@@ -250,14 +262,9 @@ function AdminDashboard() {
               Batch Issue
             </TabButton>
             {isPlatformAdmin && (
-              <>
-                <TabButton active={tab === 'institutions'} onClick={() => setTab('institutions')} icon={Building2}>
-                  Institutions
-                </TabButton>
-                <TabButton active={tab === 'security'} onClick={() => setTab('security')} icon={ShieldHalf}>
-                  Security
-                </TabButton>
-              </>
+              <TabButton active={tab === 'security'} onClick={() => setTab('security')} icon={ShieldHalf}>
+                Security
+              </TabButton>
             )}
           </>
         )}
@@ -274,7 +281,6 @@ function AdminDashboard() {
         />
       )}
       {tab === 'batch' && <BatchIssuePanel onIssued={refreshList} />}
-      {tab === 'institutions' && <InstitutionsPanel />}
       {tab === 'security' && <SecurityPanel />}
 
       <RecentActivity credentials={credentials} />

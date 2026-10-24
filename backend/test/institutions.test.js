@@ -22,7 +22,7 @@ const credential = (over = {}) => ({
 });
 
 describe('Institutions and student accounts', () => {
-  let registry, app, store, adminToken;
+  let registry, app, store, adminToken, platformToken;
   const as = (token) => ({ Authorization: `Bearer ${token}` });
 
   async function registerAndApproveCollege() {
@@ -30,7 +30,7 @@ describe('Institutions and student accounts', () => {
     expect(reg.status, JSON.stringify(reg.body)).to.equal(201);
     const approved = await request(app)
       .post(`/api/admin/institutions/${reg.body.institution.id}/approve`)
-      .set(as(adminToken));
+      .set(as(platformToken));
     expect(approved.status, JSON.stringify(approved.body)).to.equal(200);
     return { id: reg.body.institution.id, token: await login(app, COLLEGE.email, COLLEGE.password), approved: approved.body };
   }
@@ -39,7 +39,8 @@ describe('Institutions and student accounts', () => {
     registry = await ethers.deployContract('CredentialRegistry', ['Alliance University']);
     store = await seededStore();
     app = await buildApp(registry, { store });
-    adminToken = await login(app, 'registrar.admin', 'admin12345');
+    adminToken = await login(app, 'registrar.admin', 'admin12345'); // Alliance University registrar
+    platformToken = await login(app, 'platform.admin', 'platform12345');
   });
 
   describe('institution registration and approval', () => {
@@ -124,8 +125,15 @@ describe('Institutions and student accounts', () => {
 
       const collegeList = await request(app).get('/api/credentials').set(as(token));
       expect(collegeList.body.map((c) => c.credentialId)).to.deep.equal([mine.body.credentialId]);
-      const adminList = await request(app).get('/api/credentials').set(as(adminToken));
-      expect(adminList.body).to.have.length(2);
+      // Alliance University is an ordinary university: it sees only its own.
+      const allianceList = await request(app).get('/api/credentials').set(as(adminToken));
+      expect(allianceList.body.map((c) => c.credentialId)).to.deep.equal([rootCred.body.credentialId]);
+      // The platform admin manages institutions, not credentials.
+      expect((await request(app).get('/api/credentials').set(as(platformToken))).status).to.equal(403);
+      expect((await request(app).post('/api/credentials').set(as(platformToken)).send(credential())).status).to.equal(403);
+      const institutionsView = await request(app).get('/api/admin/institutions').set(as(platformToken));
+      const counts = Object.fromEntries(institutionsView.body.map((i) => [i.name, i.credentialCount]));
+      expect(counts).to.include({ 'Alliance University': 1, [COLLEGE.name]: 1 });
 
       const crossRevoke = await request(app)
         .post(`/api/credentials/${rootCred.body.credentialId}/revoke`)
@@ -161,7 +169,7 @@ describe('Institutions and student accounts', () => {
     it('suspension blocks sign-in and makes its credentials fail verification', async () => {
       const { id, token } = await registerAndApproveCollege();
       const issued = await request(app).post('/api/credentials').set(as(token)).send(credential());
-      const suspended = await request(app).post(`/api/admin/institutions/${id}/suspend`).set(as(adminToken));
+      const suspended = await request(app).post(`/api/admin/institutions/${id}/suspend`).set(as(platformToken));
       expect(suspended.status).to.equal(200);
 
       const verdict = await request(app).get(`/api/verify/${issued.body.credentialId}`);

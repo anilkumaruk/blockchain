@@ -36,8 +36,11 @@ See [SECURITY.md](SECURITY.md) for the threat model and all security controls.
 
 ## Accounts: institutions and students
 
-- **Platform admin** (`registrar.admin`, the contract owner, Alliance University) approves institutions,
-  and is the only account that sees every credential, the audit log and the pause control.
+- **Platform admin** (`platform.admin`) belongs to no university. It approves or suspends
+  institutions and runs the registry controls (pause, audit log), but cannot see, issue or revoke
+  any university's credentials.
+- **Universities** (Alliance University included) each have registrar accounts that issue, revoke
+  and view only their own credentials, signed on-chain with their own issuer wallet.
 - **Institutions** register at `/register/institution` and stay *pending* until the admin approves them.
   Approval creates the institution's own issuer wallet (encrypted with `WALLET_ENCRYPTION_KEY`),
   authorizes it on-chain with `setIssuer`, and funds it for gas. Its credentials are then recorded

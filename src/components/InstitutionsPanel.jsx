@@ -105,6 +105,7 @@ export default function InstitutionsPanel() {
                 </p>
                 <p className="text-xs text-ink-soft mt-0.5">
                   {KIND_LABEL[inst.kind] || inst.kind}
+                  {inst.credentialCount ? ` · ${inst.credentialCount.toLocaleString()} credentials` : ''}
                   {inst.email && ` · ${inst.email}`}
                   {inst.source && inst.source !== 'registration' && ` · source: ${inst.source}`}
                 </p>

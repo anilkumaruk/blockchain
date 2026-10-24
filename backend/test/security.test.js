@@ -170,25 +170,32 @@ describe('Security', () => {
         .set('Authorization', `Bearer ${t}`)
         .send({ reason: 'test' });
 
-      const log = (await request(audited).get('/api/admin/audit').set('Authorization', `Bearer ${t}`)).body;
+      // Only the platform admin can read the audit log; registrars can't.
+      expect((await request(audited).get('/api/admin/audit').set('Authorization', `Bearer ${t}`)).status).to.equal(403);
+      const p = await login(audited, 'platform.admin', 'platform12345');
+      const log = (await request(audited).get('/api/admin/audit').set('Authorization', `Bearer ${p}`)).body;
       expect(log.map((e) => e.action)).to.deep.equal([
+        'login',
         'credential_revoked',
         'credential_issued',
         'login',
         'login_failed',
       ]);
-      expect(log[0].actor).to.equal('registrar.admin');
-      expect(log[0].ip).to.be.a('string');
-      expect(log[1].target).to.equal(issued.body.credentialId);
+      expect(log[0].actor).to.equal('platform.admin');
+      expect(log[1].actor).to.equal('registrar.admin');
+      expect(log[1].ip).to.be.a('string');
+      expect(log[2].target).to.equal(issued.body.credentialId);
     });
   });
 
   describe('emergency pause', () => {
     it('blocks issuance while paused but keeps verification working', async () => {
       const auth = { Authorization: `Bearer ${token}` };
+      const platform = { Authorization: `Bearer ${await login(app, 'platform.admin', 'platform12345')}` };
       const issued = await request(app).post('/api/credentials').set(auth).send(STUDENT);
 
-      const pause = await request(app).post('/api/admin/pause').set(auth).send({ paused: true });
+      expect((await request(app).post('/api/admin/pause').set(auth).send({ paused: true })).status).to.equal(403);
+      const pause = await request(app).post('/api/admin/pause').set(platform).send({ paused: true });
       expect(pause.status).to.equal(200);
       expect((await request(app).get('/api/health')).body.paused).to.equal(true);
 
@@ -202,7 +209,7 @@ describe('Security', () => {
       const verify = await request(app).get(`/api/verify/${issued.body.credentialId}`);
       expect(verify.body.status).to.equal('valid');
 
-      await request(app).post('/api/admin/pause').set(auth).send({ paused: false });
+      await request(app).post('/api/admin/pause').set(platform).send({ paused: false });
       const resumed = await request(app)
         .post('/api/credentials')
         .set(auth)

@@ -28,7 +28,7 @@ import { loadConfig } from '../server/config.js';
 import { createChainBridge } from '../server/chain.js';
 import { createPgStore } from '../server/store.js';
 import { createInstitutionService } from '../server/institutions.js';
-import { hashPassword } from '../server/passwords.js';
+import { hashPassword, verifyPassword } from '../server/passwords.js';
 import { buildMerkleTree, leafOf } from '../server/merkle.js';
 import { slugify } from '../server/wallets.js';
 import { buildCertificateBytes, computeSha256Hex } from '../../src/lib/generateCertificatePdf.js';
@@ -122,10 +122,11 @@ const certs = load('degree_certificates');
 const certNo = (d) => d.certificate_serial_no || d.provisional_cert_no;
 const students = load('students');
 
-// LOGINS_ONLY=1 creates (or resets) the 20 test accounts and stops - useful
-// while the long on-chain part is still running or was interrupted.
+// LOGINS_ONLY=1 creates any missing test accounts and stops (existing ones keep
+// their passwords) - useful while the long on-chain part is still running.
+// Add RESET_LOGINS=1 to give every account a new password.
 if (process.env.LOGINS_ONLY === '1') {
-  await createLogins({ reset: true });
+  await createLogins({ reset: process.env.RESET_LOGINS === '1' });
   await store.close();
   process.exit(0);
 }
@@ -334,43 +335,62 @@ await store.addAudit({
 await store.close();
 console.log('Done.');
 
-/** Creates the 5 admin + 15 student test accounts and writes TEST_LOGINS.md.
- *  With reset=false, does nothing when the accounts already exist. */
+/** Creates the test accounts and writes TEST_LOGINS.md:
+ *  1 platform admin (no university), 5 university registrars (Alliance University
+ *  is one of them, like any other university) and 15 students.
+ *  Without reset, an account keeps the password listed in TEST_LOGINS.md as long
+ *  as it still matches the database; only new or mismatched accounts get one. */
 async function createLogins({ reset }) {
-  const { rows } = await store.raw("SELECT count(*)::int AS n FROM users WHERE username = 'registrar.admin'");
-  if (!reset && rows[0].n > 0) {
-    console.log('Test logins: already exist, passwords kept (see data/karnataka/TEST_LOGINS.md)');
-    return 0;
-  }
   console.log('Test logins');
+  const loginFile = path.join(DATA, 'TEST_LOGINS.md');
+  const known = new Map();
+  if (!reset && fs.existsSync(loginFile)) {
+    for (const line of fs.readFileSync(loginFile, 'utf8').split('\n')) {
+      const cells = line.split('|').map((c) => c.trim());
+      if (/^\d+$/.test(cells[1] ?? '')) known.set(cells[4], cells[5]);
+    }
+  }
+  // Before the platform/university split, Alliance's registrar doubled as platform admin.
+  await store.raw("DELETE FROM users WHERE username = 'registrar.admin' AND role = 'admin'");
+
   const newPassword = () => `Ka-${crypto.randomBytes(5).toString('hex')}`;
-  async function upsertUser(user) {
-    if (await store.getUser(user.username)) {
+  async function ensureUser(user) {
+    const existing = await store.getUser(user.username);
+    const listed = known.get(user.username);
+    if (existing && listed && (await verifyPassword(listed, existing.passwordHash))) return listed;
+    const password = newPassword();
+    const passwordHash = await hashPassword(password);
+    if (existing) {
       await store.raw('UPDATE users SET password_hash = $2, failed_attempts = 0, locked_until = NULL WHERE username = $1', [
         user.username,
-        user.passwordHash,
+        passwordHash,
       ]);
     } else {
-      await store.createUser(user);
+      await store.createUser({ ...user, passwordHash });
     }
+    return password;
   }
   const logins = [];
 
-  const ADMIN_UNIVERSITIES = ['U02', 'U01', 'U05', 'U08', 'U12']; // Alliance (platform), VTU, NITK, PES, Christ
-  for (const univId of ADMIN_UNIVERSITIES) {
+  logins.push({
+    kind: 'Platform admin',
+    institution: 'Chain of Record platform (no university)',
+    login: 'platform.admin',
+    password: await ensureUser({ username: 'platform.admin', email: 'platform.admin@example.in', role: 'admin' }),
+    detail: 'Approves / suspends universities, registry pause, audit log. Cannot see or issue credentials.',
+  });
+
+  const REGISTRAR_UNIVERSITIES = ['U02', 'U01', 'U05', 'U08', 'U12']; // Alliance, VTU, NITK, PES, Christ
+  for (const univId of REGISTRAR_UNIVERSITIES) {
     const inst = univById.get(univId);
-    const root = inst.id === rootRow.id;
     const email = `registrar@${inst.shortCode.toLowerCase()}.example.in`;
-    const username = root ? 'registrar.admin' : email;
-    const password = newPassword();
-    await upsertUser({
-      username,
-      email,
-      passwordHash: await hashPassword(password),
-      role: root ? 'admin' : 'institution',
-      institutionId: inst.id,
+    logins.push({
+      kind: 'University admin',
+      institution: inst.name,
+      login: email,
+      password: await ensureUser({ username: email, email, role: 'institution', institutionId: inst.id }),
+      detail: 'Issues, revokes and views only this university\'s credentials.',
     });
-    logins.push({ kind: root ? 'Platform admin' : 'University admin', institution: inst.name, login: username, email, password });
   }
 
   // One student per university (15 universities), each holding an ISSUED degree.
@@ -382,21 +402,18 @@ async function createLogins({ reset }) {
   }
   for (const d of picked.slice(0, 15)) {
     const s = studentById.get(d.student_id);
-    const password = newPassword();
-    await upsertUser({
-      username: s.email.toLowerCase(),
-      email: s.email.toLowerCase(),
-      passwordHash: await hashPassword(password),
-      role: 'student',
-      studentId: s.student_id,
-      institutionId: instId(d.univ_id),
-    });
+    const email = s.email.toLowerCase();
     logins.push({
       kind: 'Student',
       institution: univById.get(d.univ_id).name,
-      login: s.email.toLowerCase(),
-      email: s.email.toLowerCase(),
-      password,
+      login: email,
+      password: await ensureUser({
+        username: email,
+        email,
+        role: 'student',
+        studentId: s.student_id,
+        institutionId: instId(d.univ_id),
+      }),
       detail: `${s.full_name} · ${d.degree_name} ${d.branch} · certificate ${certNo(d)}`,
     });
   }
@@ -410,10 +427,10 @@ async function createLogins({ reset }) {
     '|---|---|---|---|---|---|',
     ...logins.map((l, i) => `| ${i + 1} | ${l.kind} | ${l.institution} | ${l.login} | ${l.password} | ${l.detail ?? ''} |`),
     '',
-    'Admins sign in at /admin (Credential Center). Students sign in at /student.',
+    'Platform admin and university admins sign in at /admin. Students sign in at /student.',
     '',
   ].join('\n');
-  fs.writeFileSync(path.join(DATA, 'TEST_LOGINS.md'), md);
+  fs.writeFileSync(loginFile, md);
   console.log(`  ${logins.length} accounts -> data/karnataka/TEST_LOGINS.md`);
   return logins.length;
 }

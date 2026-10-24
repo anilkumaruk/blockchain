@@ -61,9 +61,13 @@ export function createInstitutionService({ chain, connect, store, walletKey, fun
     return bridges.get(institution.id);
   }
 
-  /** Institution acting for a request's user; throws a tagged error if it may not issue. */
+  /** Institution acting for a request's user; throws a tagged error if it may not issue.
+   *  Only university registrars issue - the platform admin manages institutions, not credentials. */
   async function forUser(user) {
-    const inst = user.role === 'admin' && !user.institutionId ? await root() : await store.getInstitution(user.institutionId);
+    if (user.role !== 'institution' || !user.institutionId) {
+      throw Object.assign(new Error('Only university registrars can issue or manage credentials.'), { status: 403 });
+    }
+    const inst = user.institutionId === rootId ? await root() : await store.getInstitution(user.institutionId);
     if (!inst) throw Object.assign(new Error('Your account is not linked to an institution.'), { status: 403 });
     if (inst.status !== 'approved') {
       throw Object.assign(new Error(`Your institution is ${inst.status}; it cannot issue or revoke credentials.`), {

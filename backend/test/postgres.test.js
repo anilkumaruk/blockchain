@@ -34,7 +34,14 @@ const STUDENT = {
     await admin.connect();
     await admin.query(`CREATE SCHEMA ${schema}`);
     store = await createPgStore(scopedUrl());
-    await store.createUser({ username: 'registrar.admin', passwordHash: await hashPassword('admin12345'), role: 'admin' });
+    // Alliance University (the root institution) and its registrar account.
+    await store.createInstitution({ id: 'alliance-university', name: 'Alliance University', status: 'approved' });
+    await store.createUser({
+      username: 'registrar.admin',
+      passwordHash: await hashPassword('admin12345'),
+      role: 'institution',
+      institutionId: 'alliance-university',
+    });
   });
 
   after(async () => {

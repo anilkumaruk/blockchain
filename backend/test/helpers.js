@@ -12,10 +12,22 @@ import { hashPassword } from '../server/passwords.js';
 
 const ADMIN_HASH = await hashPassword('admin12345');
 const STUDENT_HASH = await hashPassword('student12345');
+const PLATFORM_HASH = await hashPassword('platform12345');
 
 export async function seededStore() {
   const store = createMemoryStore();
-  await store.createUser({ username: 'registrar.admin', passwordHash: ADMIN_HASH, role: 'admin' });
+  // The root institution exists, as it does in a deployed database; its wallet
+  // address is filled in from the contract owner on first use.
+  await store.createInstitution({ id: 'alliance-university', name: 'Alliance University', status: 'approved' });
+  // Alliance University's registrar is an ordinary university account...
+  await store.createUser({
+    username: 'registrar.admin',
+    passwordHash: ADMIN_HASH,
+    role: 'institution',
+    institutionId: 'alliance-university',
+  });
+  // ...and the platform admin (institution approvals, registry, audit) is separate.
+  await store.createUser({ username: 'platform.admin', passwordHash: PLATFORM_HASH, role: 'admin' });
   await store.createUser({
     username: 'ananya',
     passwordHash: STUDENT_HASH,
