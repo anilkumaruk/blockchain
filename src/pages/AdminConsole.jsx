@@ -118,7 +118,7 @@ function AdminLogin() {
             <Landmark size={22} className="text-teal" />
           </div>
           <p className="text-[11px] font-semibold tracking-[0.12em] text-teal uppercase mb-1">
-            {currentInstitution().name}
+            Management
           </p>
           <h1 className="text-lg font-semibold mb-1">Credential Center</h1>
           <p className="text-sm text-ink-soft mb-6">
@@ -417,8 +417,7 @@ function InstitutionPanel() {
         </p>
       </div>
       <p className="text-[10px] text-ink-soft/70 mt-3 border-t border-border pt-2.5">
-        Reference institution for this prototype — not an official integration with Alliance
-        University.
+        Prototype — not an official integration with {currentInstitution().name}.
       </p>
     </div>
   );
