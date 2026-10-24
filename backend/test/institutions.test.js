@@ -127,6 +127,7 @@ describe('Institutions and student accounts', () => {
       expect(collegeList.body.map((c) => c.credentialId)).to.deep.equal([mine.body.credentialId]);
       // Alliance University is an ordinary university: it sees only its own.
       const allianceList = await request(app).get('/api/credentials').set(as(adminToken));
+      expect(allianceList.status, JSON.stringify(allianceList.body)).to.equal(200);
       expect(allianceList.body.map((c) => c.credentialId)).to.deep.equal([rootCred.body.credentialId]);
       // The platform admin manages institutions, not credentials.
       expect((await request(app).get('/api/credentials').set(as(platformToken))).status).to.equal(403);
