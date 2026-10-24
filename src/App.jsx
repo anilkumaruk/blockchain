@@ -5,6 +5,7 @@ import AdminConsole from './pages/AdminConsole';
 import StudentPortal from './pages/StudentPortal';
 import VerificationUI from './pages/VerificationUI';
 import PublicProfile from './pages/PublicProfile';
+import InstitutionRegister from './pages/InstitutionRegister';
 import { AuthProvider } from './context/AuthContext';
 import { ToastProvider } from './context/ToastContext';
 
@@ -21,6 +22,7 @@ export default function App() {
               <Route path="/student" element={<StudentPortal />} />
               <Route path="/verify" element={<VerificationUI />} />
               <Route path="/profile/:studentId" element={<PublicProfile />} />
+              <Route path="/register/institution" element={<InstitutionRegister />} />
               <Route path="*" element={<Navigate to="/verify" replace />} />
             </Routes>
           </main>

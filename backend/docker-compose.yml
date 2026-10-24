@@ -1,0 +1,16 @@
+# Off-chain academic data layer (PostgreSQL) for local development.
+#   docker compose up -d
+#   DATABASE_URL=postgres://chain:chain@localhost:5544/chain_of_record npm start
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: chain
+      POSTGRES_PASSWORD: chain
+      POSTGRES_DB: chain_of_record
+    ports:
+      - "5544:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:

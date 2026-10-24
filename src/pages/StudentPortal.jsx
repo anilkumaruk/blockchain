@@ -25,7 +25,15 @@ import CredentialDNA from '../components/CredentialDNA';
 import VerificationProofModal from '../components/VerificationProofModal';
 import CredentialGraph from '../components/CredentialGraph';
 import AcademicJourney from '../components/AcademicJourney';
-import { getCredentialsForStudent, DEMO_STUDENT_ID } from '../lib/mockApi';
+import {
+  getCredentialsForStudent,
+  DEMO_STUDENT_ID,
+  USE_BACKEND,
+  getSession,
+  getMyCredentials,
+  signOut,
+} from '../lib/api';
+import StudentAuth from '../components/StudentAuth';
 import { downloadCertificatePdf, downloadVerifiedResumePdf } from '../lib/generateCertificatePdf';
 import {
   buildStudentProfile,
@@ -34,17 +42,60 @@ import {
   getInitials,
 } from '../lib/studentProfile';
 
+// Mock mode shows the demo student. With the real backend, students sign in
+// with their personal email and only ever see their own credentials.
 export default function StudentPortal() {
+  const [session, setSession] = useState(() => getSession());
+
+  if (!USE_BACKEND) {
+    return (
+      <StudentPortalView
+        studentId={DEMO_STUDENT_ID}
+        loadCredentials={() => getCredentialsForStudent(DEMO_STUDENT_ID)}
+      />
+    );
+  }
+  if (session?.role !== 'student') return <StudentAuth onSignedIn={setSession} />;
+  return (
+    <StudentPortalView
+      key={session.studentId}
+      studentId={session.studentId}
+      account={session.email || session.sub}
+      loadCredentials={getMyCredentials}
+      onSignOut={() => {
+        signOut();
+        setSession(null);
+      }}
+    />
+  );
+}
+
+function SignedInBar({ account, onSignOut }) {
+  if (!onSignOut) return null;
+  return (
+    <div className="flex items-center justify-end gap-3 text-xs text-ink-soft">
+      <span>
+        Signed in as <span className="font-medium text-ink">{account}</span>
+      </span>
+      <button onClick={onSignOut} className="border border-border rounded-md px-2.5 py-1 hover:text-ink hover:bg-white">
+        Sign out
+      </button>
+    </div>
+  );
+}
+
+function StudentPortalView({ studentId, account, loadCredentials, onSignOut }) {
   const { notify } = useToast();
   const [credentials, setCredentials] = useState([]);
   const [loading, setLoading] = useState(true);
   const [shareOpen, setShareOpen] = useState(false);
 
   useEffect(() => {
-    getCredentialsForStudent(DEMO_STUDENT_ID).then((data) => {
-      setCredentials(data);
-      setLoading(false);
-    });
+    loadCredentials()
+      .then(setCredentials)
+      .catch((err) => notify(err.message || 'Could not load your credentials.', 'error'))
+      .finally(() => setLoading(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   if (loading) {
@@ -57,7 +108,8 @@ export default function StudentPortal() {
 
   if (credentials.length === 0) {
     return (
-      <div className="max-w-4xl mx-auto px-4 sm:px-5 py-8">
+      <div className="max-w-4xl mx-auto px-4 sm:px-5 py-8 space-y-4">
+        <SignedInBar account={account} onSignOut={onSignOut} />
         <div className="bg-card border border-border rounded-lg p-8 text-center text-sm text-ink-soft">
           No credentials issued yet.
         </div>
@@ -65,8 +117,8 @@ export default function StudentPortal() {
     );
   }
 
-  const profile = buildStudentProfile(DEMO_STUDENT_ID, credentials);
-  const profileUrl = buildProfileUrl(DEMO_STUDENT_ID);
+  const profile = buildStudentProfile(studentId, credentials);
+  const profileUrl = buildProfileUrl(studentId);
   const yearGroups = groupCredentialsByYear(credentials);
 
   const handleDownloadResume = () => {
@@ -76,6 +128,7 @@ export default function StudentPortal() {
 
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-5 py-8 space-y-6">
+      <SignedInBar account={account} onSignOut={onSignOut} />
       <ProfileHeader
         profile={profile}
         onShare={() => setShareOpen(true)}

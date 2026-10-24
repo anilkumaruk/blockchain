@@ -28,6 +28,9 @@ import {
   Ban,
   AlertTriangle,
   ArrowRight,
+  Layers,
+  ShieldHalf,
+  Building2,
 } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useToast } from '../context/ToastContext';
@@ -35,15 +38,22 @@ import StatusBadge from '../components/StatusBadge';
 import Spinner from '../components/Spinner';
 import CredentialDNA, { shortenHash } from '../components/CredentialDNA';
 import VerificationProofModal from '../components/VerificationProofModal';
+import BatchIssuePanel from '../components/BatchIssuePanel';
+import SecurityPanel from '../components/SecurityPanel';
+import InstitutionsPanel from '../components/InstitutionsPanel';
 import {
   issueCredential,
   getAllCredentials,
   revokeCredential,
   fakeCredentialId,
   fakeTxHash,
-} from '../lib/mockApi';
+  adminLogin,
+  adminLogout,
+  currentInstitution,
+  getSession,
+  USE_BACKEND,
+} from '../lib/api';
 import { buildCertificateBytes, computeSha256Hex, downloadCertificatePdf } from '../lib/generateCertificatePdf';
-import { REFERENCE_INSTITUTION } from '../lib/institution';
 
 const CREDENTIAL_TYPES = [
   'B.Tech in Computer Science & Engineering',
@@ -55,7 +65,8 @@ const CREDENTIAL_TYPES = [
 
 export default function AdminConsole() {
   const { adminAuthed } = useAuth();
-  return adminAuthed ? <AdminDashboard /> : <AdminLogin />;
+  const restored = ['admin', 'institution'].includes(getSession()?.role);
+  return adminAuthed || restored ? <AdminDashboard /> : <AdminLogin />;
 }
 
 // ---- Login -----------------------------------------------------------------
@@ -68,7 +79,7 @@ function AdminLogin() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
     if (!username.trim() || !password.trim()) {
@@ -76,11 +87,15 @@ function AdminLogin() {
       return;
     }
     setLoading(true);
-    setTimeout(() => {
-      setLoading(false);
+    try {
+      await adminLogin(username.trim(), password);
       setAdminAuthed(true);
       notify('Signed in to the Credential Center.', 'success');
-    }, 550);
+    } catch (err) {
+      setError(err.message || 'Sign-in failed.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -91,23 +106,25 @@ function AdminLogin() {
             <Landmark size={22} className="text-teal" />
           </div>
           <p className="text-[11px] font-semibold tracking-[0.12em] text-teal uppercase mb-1">
-            {REFERENCE_INSTITUTION.name}
+            {currentInstitution().name}
           </p>
           <h1 className="text-lg font-semibold mb-1">Credential Center</h1>
           <p className="text-sm text-ink-soft mb-6">
-            Sign in to issue, manage and verify the integrity of academic credentials. This is a
-            mock login for the prototype — any non-empty username and password will work.
+            Sign in to issue, manage and verify the integrity of academic credentials.
+            {USE_BACKEND
+              ? ' Signed in with a JWT issued by the Chain of Record server.'
+              : ' This is a mock login for the prototype — any non-empty username and password will work.'}
           </p>
 
           <form onSubmit={handleSubmit} className="space-y-3.5">
             <div>
               <label className="block text-xs font-medium text-ink-soft mb-1.5">
-                Registrar username
+                {USE_BACKEND ? 'Email or username' : 'Registrar username'}
               </label>
               <input
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="registrar.admin"
+                placeholder={USE_BACKEND ? 'registrar@college.edu' : 'registrar.admin'}
                 className="w-full rounded-md border border-border bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-teal/30 focus:border-teal"
               />
             </div>
@@ -133,6 +150,14 @@ function AdminLogin() {
               {loading ? 'Signing in…' : 'Sign in'}
             </button>
           </form>
+          {USE_BACKEND && (
+            <p className="text-xs text-ink-soft mt-5 text-center">
+              New institution?{' '}
+              <Link to="/register/institution" className="text-teal font-medium hover:underline">
+                Register to issue credentials
+              </Link>
+            </p>
+          )}
         </div>
       </div>
     </div>
@@ -143,6 +168,8 @@ function AdminLogin() {
 
 function AdminDashboard() {
   const { setAdminAuthed } = useAuth();
+  // Approving institutions and the registry controls belong to the platform owner only.
+  const isPlatformAdmin = !USE_BACKEND || getSession()?.role === 'admin';
   const [tab, setTab] = useState('issue');
   const [credentials, setCredentials] = useState([]);
   const [loadingList, setLoadingList] = useState(true);
@@ -182,7 +209,7 @@ function AdminDashboard() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <p className="text-[11px] font-semibold tracking-[0.14em] text-teal uppercase mb-1">
-            {REFERENCE_INSTITUTION.name}
+            {currentInstitution().name}
           </p>
           <h1 className="text-xl font-semibold">Credential Center</h1>
           <p className="text-sm text-ink-soft mt-0.5">
@@ -190,7 +217,10 @@ function AdminDashboard() {
           </p>
         </div>
         <button
-          onClick={() => setAdminAuthed(false)}
+          onClick={() => {
+            adminLogout();
+            setAdminAuthed(false);
+          }}
           className="text-sm text-ink-soft hover:text-ink border border-border rounded-md px-3 py-1.5 shrink-0"
         >
           Sign out
@@ -207,24 +237,45 @@ function AdminDashboard() {
         <InstitutionPanel />
       </div>
 
-      <div className="flex gap-1 bg-white border border-border rounded-lg p-1 w-fit">
+      <div className="flex flex-wrap gap-1 bg-white border border-border rounded-lg p-1 w-fit max-w-full">
         <TabButton active={tab === 'issue'} onClick={() => setTab('issue')} icon={Plus}>
           Issue Credential
         </TabButton>
         <TabButton active={tab === 'manage'} onClick={() => setTab('manage')} icon={Table2}>
           Manage Credentials
         </TabButton>
+        {USE_BACKEND && (
+          <>
+            <TabButton active={tab === 'batch'} onClick={() => setTab('batch')} icon={Layers}>
+              Batch Issue
+            </TabButton>
+            {isPlatformAdmin && (
+              <>
+                <TabButton active={tab === 'institutions'} onClick={() => setTab('institutions')} icon={Building2}>
+                  Institutions
+                </TabButton>
+                <TabButton active={tab === 'security'} onClick={() => setTab('security')} icon={ShieldHalf}>
+                  Security
+                </TabButton>
+              </>
+            )}
+          </>
+        )}
       </div>
 
-      {tab === 'issue' ? (
+      {tab === 'issue' && (
         <IssuePanel credentials={credentials} onIssued={refreshList} onViewCredential={openDetail} />
-      ) : (
+      )}
+      {tab === 'manage' && (
         <RegistryPanel
           credentials={credentials}
           loading={loadingList}
           onSelectCredential={setDetailCredential}
         />
       )}
+      {tab === 'batch' && <BatchIssuePanel onIssued={refreshList} />}
+      {tab === 'institutions' && <InstitutionsPanel />}
+      {tab === 'security' && <SecurityPanel />}
 
       <RecentActivity credentials={credentials} />
 
@@ -347,7 +398,7 @@ function InstitutionPanel() {
         <span className="w-9 h-9 rounded-lg bg-teal-soft text-teal flex items-center justify-center shrink-0">
           <Landmark size={16} aria-hidden="true" />
         </span>
-        <p className="text-sm font-semibold">{REFERENCE_INSTITUTION.name}</p>
+        <p className="text-sm font-semibold">{currentInstitution().name}</p>
       </div>
       <div className="space-y-1 text-xs text-ink-soft">
         <p className="flex items-center gap-1.5">
@@ -372,6 +423,7 @@ function InstitutionPanel() {
 const EMPTY_FORM = {
   studentName: '',
   studentId: '',
+  studentEmail: '',
   credentialType: CREDENTIAL_TYPES[0],
   issueDate: new Date().toISOString().slice(0, 10),
 };
@@ -429,7 +481,7 @@ function IssuePanel({ credentials, onIssued, onViewCredential }) {
         studentId: form.studentId,
         credentialType: form.credentialType,
         issueDate: form.issueDate,
-        issuer: REFERENCE_INSTITUTION.name,
+        issuer: currentInstitution().name,
         txHash: candidate.txHash,
       };
       const bytes = buildCertificateBytes(fields);
@@ -470,13 +522,14 @@ function IssuePanel({ credentials, onIssued, onViewCredential }) {
         issueDate: form.issueDate,
         credentialId: candidate.credentialId,
         txHash: candidate.txHash,
+        ...(USE_BACKEND && form.studentEmail.trim() ? { studentEmail: form.studentEmail.trim() } : {}),
       });
       setResult(res);
       setStep('success');
       notify(`Credential ${res.credentialId} issued.`, 'success');
       onIssued();
-    } catch {
-      notify('Failed to issue credential. Please try again.', 'error');
+    } catch (err) {
+      notify(err.message || 'Failed to issue credential. Please try again.', 'error');
     } finally {
       setIssuing(false);
     }
@@ -582,6 +635,23 @@ function StepStudentDetails({ form, update, onContinue }) {
             className="w-full rounded-md border border-border bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-teal/30 focus:border-teal"
           />
         </div>
+        {USE_BACKEND && (
+          <div>
+            <label className="block text-xs font-medium text-ink-soft mb-1.5">
+              Student personal email <span className="font-normal">(optional)</span>
+            </label>
+            <input
+              type="email"
+              value={form.studentEmail}
+              onChange={update('studentEmail')}
+              placeholder="e.g. divya.menon@gmail.com"
+              className="w-full rounded-md border border-border bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-teal/30 focus:border-teal"
+            />
+            <p className="text-[11px] text-ink-soft mt-1">
+              Lets the student create their own login on the Student portal with this email.
+            </p>
+          </div>
+        )}
       </div>
 
       <div className="border border-border rounded-md p-3.5 bg-bg/50 mb-6">
@@ -590,7 +660,7 @@ function StepStudentDetails({ form, update, onContinue }) {
         </p>
         <div className="flex items-center gap-2">
           <Landmark size={15} className="text-teal shrink-0" aria-hidden="true" />
-          <p className="text-sm font-medium">{REFERENCE_INSTITUTION.name}</p>
+          <p className="text-sm font-medium">{currentInstitution().name}</p>
         </div>
         <p className="text-xs text-valid flex items-center gap-1 mt-1.5">
           <Check size={11} aria-hidden="true" />
@@ -709,7 +779,7 @@ function StepReview({
       <div className="border border-border rounded-lg overflow-hidden mb-5">
         <div className="bg-bg px-4 py-2.5 text-center">
           <p className="text-[11px] font-semibold tracking-[0.12em] text-teal uppercase">
-            {REFERENCE_INSTITUTION.name}
+            {currentInstitution().name}
           </p>
         </div>
         <div className="p-4 space-y-3">
@@ -799,7 +869,7 @@ function SuccessPanel({ result, onViewCredential, onIssueAnother }) {
         <ReviewRow label="Credential" value={result.record.credentialType} />
         <ReviewRow label="Credential ID" value={result.credentialId} mono />
         <ReviewRow label="Status" value="ACTIVE" />
-        <ReviewRow label="Issuer" value={REFERENCE_INSTITUTION.name} />
+        <ReviewRow label="Issuer" value={currentInstitution().name} />
       </div>
 
       <div className="border border-border rounded-md p-3.5 mb-5 bg-bg/50">
@@ -1138,8 +1208,8 @@ function RevokeModal({ credential, onClose, onRevoked }) {
       const updated = await revokeCredential(credential.credentialId, reason);
       setRevokedRecord(updated);
       notify(`Credential ${credential.credentialId} has been revoked.`, 'warning');
-    } catch {
-      notify('Failed to revoke credential. Please try again.', 'error');
+    } catch (err) {
+      notify(err.message || 'Failed to revoke credential. Please try again.', 'error');
       setLoading(false);
     }
   };
@@ -1319,7 +1389,7 @@ function RecentActivity({ credentials }) {
 // ---- How issuance works ---------------------------------------------------
 
 const ISSUANCE_STEPS = [
-  { icon: Landmark, title: 'Institution', body: `${REFERENCE_INSTITUTION.name} initiates issuance.` },
+  { icon: Landmark, title: 'Institution', body: `${currentInstitution().name} initiates issuance.` },
   { icon: FileText, title: 'Create credential', body: 'Student and credential details are recorded.' },
   { icon: ClipboardList, title: 'Generate certificate', body: 'A deterministic certificate document is generated.' },
   { icon: Fingerprint, title: 'Calculate Credential DNA', body: 'A SHA-256 fingerprint of the certificate is computed.' },

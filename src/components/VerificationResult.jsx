@@ -5,6 +5,8 @@ import VerificationChecks from './VerificationChecks';
 import CredentialDNA from './CredentialDNA';
 import HashChip from './HashChip';
 import VerificationProofModal from './VerificationProofModal';
+import OnChainHistory from './OnChainHistory';
+import { USE_BACKEND } from '../lib/api';
 import { resolveVerificationState, getVerificationChecks } from '../lib/verification';
 
 const CARD_TONE = {
@@ -97,6 +99,8 @@ export default function VerificationResult({ result, queryType, verifiedAt, refe
             </div>
           </div>
         )}
+
+        {showRecord && USE_BACKEND && d.credentialId && <OnChainHistory credentialId={d.credentialId} />}
 
         {state === 'mismatch' && (
           <div className="border-t border-border pt-4 space-y-3">

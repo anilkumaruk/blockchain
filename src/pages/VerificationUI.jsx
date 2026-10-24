@@ -27,7 +27,7 @@ import VerificationHistory, {
   clearVerificationHistory,
 } from '../components/VerificationHistory';
 import QrScanTab from '../components/QrScanTab';
-import { verifyCredential, getAllCredentials } from '../lib/mockApi';
+import { verifyCredential, getAllCredentials } from '../lib/api';
 import { resolveVerificationState } from '../lib/verification';
 
 const TABS = [
@@ -90,6 +90,9 @@ export default function VerificationUI() {
       else if (res.status === 'revoked') notify('Credential found but has been revoked.', 'warning');
       else if (state === 'mismatch') notify('Document fingerprint does not match.', 'error');
       else notify('No matching credential found.', 'error');
+    } catch (err) {
+      // Fail safe: never show a verdict when the chain can't be reached.
+      notify(err.message || 'Verification could not be completed.', 'error');
     } finally {
       setVerifying(false);
     }

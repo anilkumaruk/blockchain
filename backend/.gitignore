@@ -1,0 +1,8 @@
+node_modules
+.env
+cache
+artifacts
+deployments/localhost.json
+certs/*
+!certs/.gitkeep
+data/karnataka/TEST_LOGINS.md

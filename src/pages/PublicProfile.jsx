@@ -23,7 +23,7 @@ import CredentialDNA from '../components/CredentialDNA';
 import AcademicJourney from '../components/AcademicJourney';
 import ShareProfileModal from '../components/ShareProfileModal';
 import { useToast } from '../context/ToastContext';
-import { getCredentialsForStudent } from '../lib/mockApi';
+import { getCredentialsForStudent } from '../lib/api';
 import { downloadVerifiedResumePdf } from '../lib/generateCertificatePdf';
 import {
   buildStudentProfile,
