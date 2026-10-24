@@ -15,7 +15,8 @@ import { createApp } from './app.js';
  * @param {{ bootstrapAdmin?: boolean }} [options]
  */
 export async function createRuntime(config, deployment, { bootstrapAdmin = true } = {}) {
-  const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true });
+  // cacheTimeout -1: never reuse a cached nonce for back-to-back transactions.
+  const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true, cacheTimeout: -1 });
   // The local chain mines instantly; don't wait ethers' default 4 s between receipt checks.
   if (config.network === 'localhost') provider.pollingInterval = 200;
   const signer = new Wallet(config.issuerKey, provider);

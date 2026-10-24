@@ -247,7 +247,7 @@ export async function createPgStore(connectionString, { ssl } = {}) {
     connectionString: ssl ? stripSslParams(connectionString) : connectionString,
     ssl,
     max: Number(process.env.DATABASE_POOL_MAX || 10),
-    connectionTimeoutMillis: 10_000,
+    connectionTimeoutMillis: 30_000,
     // Hosted poolers (Supabase Supavisor, PgBouncer) close idle connections on
     // their side; keep sockets alive and retire idle clients before that happens.
     keepAlive: true,

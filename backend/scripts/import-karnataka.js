@@ -11,7 +11,12 @@
 //
 //   npm run import:karnataka
 //
-// Expects empty tables (run `node scripts/reset-db.js --confirm` first).
+// Resumable: if a run is interrupted (network, RPC, database), just run it
+// again. Every phase skips what is already done - universities and wallets are
+// reused, rows are inserted with ON CONFLICT DO NOTHING, universities whose
+// certificates are already anchored are skipped, revoked certificates are not
+// revoked twice, and existing test accounts get fresh passwords.
+// For a clean start run `node scripts/reset-db.js --confirm` first.
 
 import 'dotenv/config';
 import crypto from 'node:crypto';
@@ -40,7 +45,7 @@ if (errors.length || config.useMemoryStore) {
 }
 
 const deployment = JSON.parse(fs.readFileSync(path.join(here, '..', 'deployments', `${config.network}.json`), 'utf8'));
-const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true });
+const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true, cacheTimeout: -1 });
 // The local chain mines instantly; don't wait ethers' default 4 s between receipt checks.
 if (config.network === 'localhost') provider.pollingInterval = 200;
 const contract = new Contract(config.contractAddress || deployment.address, deployment.abi, new Wallet(config.issuerKey, provider));
@@ -57,22 +62,20 @@ const institutions = createInstitutionService({
   trustedIssuer: config.trustedIssuer,
 });
 
-const { rows: existing } = await store.raw('SELECT count(*)::int AS n FROM credentials');
-if (existing[0].n > 0) {
-  console.error('credentials is not empty. Run `node scripts/reset-db.js --confirm` first.');
-  process.exit(1);
-}
 
 const yn = (v) => (v === 'Y' ? true : v === 'N' ? false : null);
 const isoDate = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
 
-/** Multi-row parameterized INSERT in chunks. */
+/** Multi-row parameterized INSERT in chunks; rows that already exist are skipped. */
 async function insertRows(table, columns, rows, chunk = 400) {
   for (let i = 0; i < rows.length; i += chunk) {
     const part = rows.slice(i, i + chunk);
     const params = [];
     const values = part.map((r) => `(${columns.map((c) => (params.push(r[c] ?? null), `$${params.length}`)).join(', ')})`);
-    await store.raw(`INSERT INTO ${table} (${columns.join(', ')}) VALUES ${values.join(', ')}`, params);
+    await store.raw(
+      `INSERT INTO ${table} (${columns.join(', ')}) VALUES ${values.join(', ')} ON CONFLICT DO NOTHING`,
+      params
+    );
   }
   console.log(`  ${table.padEnd(22)} ${rows.length}`);
 }
@@ -99,16 +102,33 @@ for (const u of load('universities')) {
     ugcRecognised: yn(u.ugc_recognised),
   };
   let inst;
-  if (slugify(u.univ_name) === rootRow.id) {
+  const id = slugify(u.univ_name);
+  if (id === rootRow.id) {
     inst = await store.updateInstitution(rootRow.id, attrs); // the platform owner itself
   } else {
-    await store.createInstitution({ id: slugify(u.univ_name), name: u.univ_name, status: 'pending', ...attrs });
-    inst = await institutions.approve(slugify(u.univ_name), `import:${SOURCE}`);
+    // Resumable: an interrupted run may already have created / approved it.
+    if (!(await store.getInstitution(id))) {
+      await store.createInstitution({ id, name: u.univ_name, status: 'pending', ...attrs });
+    }
+    const current = await store.getInstitution(id);
+    inst = current.status === 'approved' ? current : await institutions.approve(id, `import:${SOURCE}`);
   }
   univById.set(u.univ_id, await store.getInstitution(inst.id));
   console.log(`  ${u.short_code.padEnd(8)} ${inst.walletAddress}  ${u.univ_name}`);
 }
 const instId = (univId) => univById.get(univId).id;
+
+const certs = load('degree_certificates');
+const certNo = (d) => d.certificate_serial_no || d.provisional_cert_no;
+const students = load('students');
+
+// LOGINS_ONLY=1 creates (or resets) the 20 test accounts and stops - useful
+// while the long on-chain part is still running or was interrupted.
+if (process.env.LOGINS_ONLY === '1') {
+  await createLogins({ reset: true });
+  await store.close();
+  process.exit(0);
+}
 
 // ---- colleges, programs ----------------------------------------------------
 console.log('Academic records');
@@ -127,7 +147,6 @@ await insertRows(
 // ---- students, enrollments, semester results ---------------------------------
 const enrollments = load('enrollments');
 const univOfStudent = new Map(enrollments.map((e) => [e.student_id, e.univ_id]));
-const students = load('students');
 await insertRows(
   'students',
   ['student_id', 'full_name', 'email', 'institution_id', 'source', 'reg_no', 'abc_apaar_id', 'father_name',
@@ -156,8 +175,6 @@ await insertRows(
 
 // ---- degree certificates -> on-chain credentials (one Merkle batch per university)
 console.log('Degree certificates -> blockchain');
-const certs = load('degree_certificates');
-const certNo = (d) => d.certificate_serial_no || d.provisional_cert_no;
 const credIdOf = (no) => no.replace(/\//g, '-');
 const byCertNo = new Map(certs.map((d) => [certNo(d), d]));
 const credentialOf = new Map(); // certificate_id -> credential record
@@ -166,6 +183,23 @@ let gasTotal = 0n;
 for (const [univId, inst] of univById) {
   const mine = certs.filter((d) => d.univ_id === univId);
   if (!mine.length) continue;
+  // Already anchored and recorded by an earlier run? insertMany is all-or-nothing.
+  const done = await store.raw('SELECT * FROM credentials WHERE institution_id = $1', [inst.id]);
+  if (done.rows.length === mine.length) {
+    const byNo = new Map(done.rows.map((r) => [r.certificate_no, r]));
+    for (const d of mine) {
+      const r = byNo.get(certNo(d));
+      credentialOf.set(d.certificate_id, {
+        credentialId: r.credential_id,
+        hash: r.doc_hash,
+        batch: r.batch,
+        issueDate: r.issue_date,
+        status: r.status,
+      });
+    }
+    console.log(`  ${inst.shortCode.padEnd(8)} already anchored (${mine.length}), skipped`);
+    continue;
+  }
   const fieldsList = mine.map((d) => ({
     credentialId: credIdOf(certNo(d)),
     studentName: d.candidate_name,
@@ -212,12 +246,20 @@ for (const [univId, inst] of univById) {
 let revoked = 0;
 for (const d of certs.filter((c) => ['REVOKED', 'WITHHELD', 'CANCELLED_DUPLICATE_ISSUED'].includes(c.certificate_status))) {
   const rec = credentialOf.get(d.certificate_id);
+  if (rec.status === 'revoked') continue; // done in an earlier run
   const inst = univById.get(d.univ_id);
   const reason = d.certificate_status === 'WITHHELD' ? `Withheld: ${d.revocation_reason}` : d.revocation_reason;
-  const receipt = await (await institutions.bridgeFor(inst)).revokeBatch(
-    { ...rec.batch, credentialId: rec.credentialId, hash: rec.hash },
-    reason
-  );
+  let receipt;
+  try {
+    receipt = await (await institutions.bridgeFor(inst)).revokeBatch(
+      { ...rec.batch, credentialId: rec.credentialId, hash: rec.hash },
+      reason
+    );
+  } catch (err) {
+    // An interrupted run may have revoked it on-chain without recording it.
+    if (err.reason !== 'AlreadyRevoked') throw err;
+    receipt = { txHash: null, blockNumber: null, gasUsed: 0n };
+  }
   gasTotal += BigInt(receipt.gasUsed);
   const patch = {
     status: 'revoked',
@@ -255,7 +297,8 @@ await insertRows(
     nad_uploaded: yn(d.nad_uploaded),
   }))
 );
-await insertRows(
+const nadCount = Number((await store.raw('SELECT count(*) FROM nad_awards')).rows[0].count);
+if (nadCount === 0) await insertRows(
   'nad_awards',
   ['org_name', 'org_code', 'org_address', 'org_city', 'org_state', 'org_pin', 'academic_course_id', 'course_name',
     'stream', 'session', 'regn_no', 'rroll', 'abc_account_id', 'cname', 'gender', 'dob', 'fname', 'mname', 'photo',
@@ -272,69 +315,8 @@ await insertRows(
 );
 
 // ---- test logins ------------------------------------------------------------
-console.log('Test logins');
-const newPassword = () => `Ka-${crypto.randomBytes(5).toString('hex')}`;
-const logins = [];
-
-const ADMIN_UNIVERSITIES = ['U02', 'U01', 'U05', 'U08', 'U12']; // Alliance (platform), VTU, NITK, PES, Christ
-for (const univId of ADMIN_UNIVERSITIES) {
-  const inst = univById.get(univId);
-  const root = inst.id === rootRow.id;
-  const email = `registrar@${inst.shortCode.toLowerCase()}.example.in`;
-  const username = root ? 'registrar.admin' : email;
-  const password = newPassword();
-  await store.createUser({
-    username,
-    email,
-    passwordHash: await hashPassword(password),
-    role: root ? 'admin' : 'institution',
-    institutionId: inst.id,
-  });
-  logins.push({ kind: root ? 'Platform admin' : 'University admin', institution: inst.name, login: username, email, password });
-}
-
-// One student per university (15 universities), each holding an ISSUED degree.
-const studentById = new Map(students.map((s) => [s.student_id, s]));
-const picked = [];
-for (const univId of [...univById.keys()].filter((u) => u !== 'U07' && u !== 'U03')) {
-  const d = certs.find((c) => c.univ_id === univId && c.certificate_status === 'ISSUED' && !c.revocation_reason);
-  if (d) picked.push(d);
-}
-for (const d of picked.slice(0, 15)) {
-  const s = studentById.get(d.student_id);
-  const password = newPassword();
-  await store.createUser({
-    username: s.email.toLowerCase(),
-    email: s.email.toLowerCase(),
-    passwordHash: await hashPassword(password),
-    role: 'student',
-    studentId: s.student_id,
-    institutionId: instId(d.univ_id),
-  });
-  logins.push({
-    kind: 'Student',
-    institution: univById.get(d.univ_id).name,
-    login: s.email.toLowerCase(),
-    email: s.email.toLowerCase(),
-    password,
-    detail: `${s.full_name} · ${d.degree_name} ${d.branch} · certificate ${certNo(d)}`,
-  });
-}
-
-const md = [
-  '# Test logins (synthetic Karnataka Degree Registry)',
-  '',
-  'Generated by `npm run import:karnataka`. Local test accounts only; git-ignored. Regenerated on every import.',
-  '',
-  '| # | Role | Institution | Sign-in (email / username) | Password | Details |',
-  '|---|---|---|---|---|---|',
-  ...logins.map((l, i) => `| ${i + 1} | ${l.kind} | ${l.institution} | ${l.login} | ${l.password} | ${l.detail ?? ''} |`),
-  '',
-  'Admins sign in at /admin (Credential Center). Students sign in at /student.',
-  '',
-].join('\n');
-fs.writeFileSync(path.join(DATA, 'TEST_LOGINS.md'), md);
-console.log(`  ${logins.length} accounts -> data/karnataka/TEST_LOGINS.md`);
+// Created once; later runs keep the existing passwords (and TEST_LOGINS.md).
+const loginCount = await createLogins({ reset: false });
 
 await store.addAudit({
   actor: `import:${SOURCE}`,
@@ -346,8 +328,92 @@ await store.addAudit({
     certificates: certs.length,
     revokedOnChain: revoked,
     gas: String(gasTotal),
-    logins: logins.length,
+    logins: loginCount,
   },
 });
 await store.close();
 console.log('Done.');
+
+/** Creates the 5 admin + 15 student test accounts and writes TEST_LOGINS.md.
+ *  With reset=false, does nothing when the accounts already exist. */
+async function createLogins({ reset }) {
+  const { rows } = await store.raw("SELECT count(*)::int AS n FROM users WHERE username = 'registrar.admin'");
+  if (!reset && rows[0].n > 0) {
+    console.log('Test logins: already exist, passwords kept (see data/karnataka/TEST_LOGINS.md)');
+    return 0;
+  }
+  console.log('Test logins');
+  const newPassword = () => `Ka-${crypto.randomBytes(5).toString('hex')}`;
+  async function upsertUser(user) {
+    if (await store.getUser(user.username)) {
+      await store.raw('UPDATE users SET password_hash = $2, failed_attempts = 0, locked_until = NULL WHERE username = $1', [
+        user.username,
+        user.passwordHash,
+      ]);
+    } else {
+      await store.createUser(user);
+    }
+  }
+  const logins = [];
+
+  const ADMIN_UNIVERSITIES = ['U02', 'U01', 'U05', 'U08', 'U12']; // Alliance (platform), VTU, NITK, PES, Christ
+  for (const univId of ADMIN_UNIVERSITIES) {
+    const inst = univById.get(univId);
+    const root = inst.id === rootRow.id;
+    const email = `registrar@${inst.shortCode.toLowerCase()}.example.in`;
+    const username = root ? 'registrar.admin' : email;
+    const password = newPassword();
+    await upsertUser({
+      username,
+      email,
+      passwordHash: await hashPassword(password),
+      role: root ? 'admin' : 'institution',
+      institutionId: inst.id,
+    });
+    logins.push({ kind: root ? 'Platform admin' : 'University admin', institution: inst.name, login: username, email, password });
+  }
+
+  // One student per university (15 universities), each holding an ISSUED degree.
+  const studentById = new Map(students.map((s) => [s.student_id, s]));
+  const picked = [];
+  for (const univId of [...univById.keys()].filter((u) => u !== 'U07' && u !== 'U03')) {
+    const d = certs.find((c) => c.univ_id === univId && c.certificate_status === 'ISSUED' && !c.revocation_reason);
+    if (d) picked.push(d);
+  }
+  for (const d of picked.slice(0, 15)) {
+    const s = studentById.get(d.student_id);
+    const password = newPassword();
+    await upsertUser({
+      username: s.email.toLowerCase(),
+      email: s.email.toLowerCase(),
+      passwordHash: await hashPassword(password),
+      role: 'student',
+      studentId: s.student_id,
+      institutionId: instId(d.univ_id),
+    });
+    logins.push({
+      kind: 'Student',
+      institution: univById.get(d.univ_id).name,
+      login: s.email.toLowerCase(),
+      email: s.email.toLowerCase(),
+      password,
+      detail: `${s.full_name} · ${d.degree_name} ${d.branch} · certificate ${certNo(d)}`,
+    });
+  }
+
+  const md = [
+    '# Test logins (synthetic Karnataka Degree Registry)',
+    '',
+    'Created by `npm run import:karnataka`. Test accounts only; git-ignored. New passwords: `LOGINS_ONLY=1 npm run import:karnataka`.',
+    '',
+    '| # | Role | Institution | Sign-in (email / username) | Password | Details |',
+    '|---|---|---|---|---|---|',
+    ...logins.map((l, i) => `| ${i + 1} | ${l.kind} | ${l.institution} | ${l.login} | ${l.password} | ${l.detail ?? ''} |`),
+    '',
+    'Admins sign in at /admin (Credential Center). Students sign in at /student.',
+    '',
+  ].join('\n');
+  fs.writeFileSync(path.join(DATA, 'TEST_LOGINS.md'), md);
+  console.log(`  ${logins.length} accounts -> data/karnataka/TEST_LOGINS.md`);
+  return logins.length;
+}

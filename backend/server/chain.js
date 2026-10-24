@@ -71,8 +71,29 @@ export function createChainBridge(contract, { timeoutMs = 8000, writeTimeoutMs =
 
   const write = (fn) => call(fn, writeTimeoutMs);
 
+  // Polls for the receipt instead of tx.wait(): a dropped connection or a
+  // flaky public RPC only delays the check, it doesn't abandon a transaction
+  // that is already broadcast. The overall limit is writeTimeoutMs.
+  const waitForReceipt = async (tx) => {
+    const provider = contract.runner.provider;
+    const interval = Math.min(provider.pollingInterval ?? 1000, 1500);
+    for (;;) {
+      try {
+        const receipt = await provider.getTransactionReceipt(tx.hash);
+        if (receipt) {
+          if (receipt.status !== 1) throw Object.assign(new Error('Transaction reverted'), { reverted: true });
+          return receipt;
+        }
+      } catch (err) {
+        if (err.reverted) throw err;
+        // transient RPC/network error: keep polling
+      }
+      await new Promise((resolve) => setTimeout(resolve, interval));
+    }
+  };
+
   const receiptOf = async (tx) => {
-    const receipt = await tx.wait();
+    const receipt = await waitForReceipt(tx);
     return { txHash: receipt.hash, blockNumber: receipt.blockNumber, gasUsed: receipt.gasUsed, logs: receipt.logs };
   };
 

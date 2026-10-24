@@ -42,7 +42,7 @@ const credentials = read('03_credentials.jsonld');
 const deployment = JSON.parse(
   fs.readFileSync(path.join(here, '..', 'deployments', `${config.network}.json`), 'utf8')
 );
-const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true });
+const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true, cacheTimeout: -1 });
 const contract = new Contract(config.contractAddress || deployment.address, deployment.abi, new Wallet(config.issuerKey, provider));
 const bridgeOptions = { fromBlock: deployment.blockNumber ?? 0 };
 const store = await createPgStore(config.databaseUrl, { ssl: config.databaseSsl });
