@@ -106,6 +106,15 @@ describe('Integrity', () => {
       expect((await request(app).get(`/api/verify/${CRED.credentialId}`)).body.status).to.equal('valid');
     });
 
+    it('can retry a batch whose database save failed', async () => {
+      const batch = { credentials: [1, 2, 3].map((i) => ({ ...CRED, studentId: `B${i}`, credentialId: `COR-2026-BAT00${i}` })) };
+      failOnce('insertMany');
+      expect((await request(app).post('/api/credentials/batch').set(auth()).send(batch)).status).to.equal(500);
+      const retry = await request(app).post('/api/credentials/batch').set(auth()).send(batch);
+      expect(retry.status, JSON.stringify(retry.body)).to.equal(201);
+      expect((await request(app).get('/api/verify/COR-2026-BAT003')).body.status).to.equal('valid');
+    });
+
     it('still rejects an ID that is on the chain for a different certificate', async () => {
       await ledger.bridge(AUTHORITY).issue('COR-2026-INT002', `0x${'ab'.repeat(32)}`);
       const res = await request(app).post('/api/credentials').set(auth()).send({ ...CRED, credentialId: 'COR-2026-INT002' });

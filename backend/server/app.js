@@ -720,14 +720,20 @@ export function createApp({
       const issuerBridge = await institutions.bridgeFor(inst);
       if (issuerBridge.issueMany) {
         // Own chain: each certificate is a signed transaction; blocks hold up to 25.
-        const receipts = await issuerBridge.issueMany(
-          fieldsList.map((f, i) => ({
-            credentialId: f.credentialId,
-            certNo: f.credentialId,
-            hash: hashes[i],
-            certHash: sha256(issuedCanonical(f)),
-          }))
-        );
+        // Certificates an earlier, interrupted attempt already recorded are not sent again.
+        const receipts = await Promise.all(fieldsList.map((f, i) => issuedEarlier(f.credentialId, hashes[i], inst)));
+        const pending = receipts.flatMap((r, i) => (r ? [] : [i]));
+        const fresh = pending.length
+          ? await issuerBridge.issueMany(
+              pending.map((i) => ({
+                credentialId: fieldsList[i].credentialId,
+                certNo: fieldsList[i].credentialId,
+                hash: hashes[i],
+                certHash: sha256(issuedCanonical(fieldsList[i])),
+              }))
+            )
+          : [];
+        pending.forEach((i, k) => (receipts[i] = fresh[k]));
         const contract = await chain.address();
         const records = await store.insertMany(
           fieldsList.map((f, i) => ({
