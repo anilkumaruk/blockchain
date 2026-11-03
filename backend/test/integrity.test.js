@@ -1,8 +1,14 @@
 // Integrity under concurrency, forged storage and partial failures.
 
 import { expect } from 'chai';
+import request from 'supertest';
 import { merkleRoot, mine, sha256, transactionId } from '../blockchain/index.js';
 import { createLedger, createMemoryLedgerStore, deriveValidatorKeys } from '../server/ledger.js';
+import { createApp } from '../server/app.js';
+import { createAuth } from '../server/auth.js';
+import { createMemoryStore } from '../server/store.js';
+import { hashPassword } from '../server/passwords.js';
+import { TEST_WALLET_KEY } from './helpers.js';
 
 const AUTHORITY = `0x${sha256('integrity-authority')}`;
 const hash = (s) => sha256(s);
@@ -50,5 +56,55 @@ describe('Integrity', () => {
     await restarted.getById('F-1').then((a) => (answer = a), (e) => (error = e));
     expect(answer?.certHash, 'the forged hash must never be returned').to.not.equal(hash('forged'));
     expect(error?.name).to.equal('ChainUnavailableError');
+  });
+
+  describe('database failure after the chain write', () => {
+    let app, store, token;
+    const CRED = { studentName: 'Asha Rao', studentId: 'AU1', credentialType: 'B.Tech', issueDate: '2026-06-15', credentialId: 'COR-2026-INT001' };
+    const auth = () => ({ Authorization: `Bearer ${token}` });
+    const failOnce = (name) => {
+      const original = store[name];
+      store[name] = async () => {
+        store[name] = original;
+        throw new Error('database unavailable');
+      };
+    };
+
+    before(async () => {
+      store = createMemoryStore();
+      const ledger = createLedger(options(createMemoryLedgerStore(), 'd'));
+      await store.createInstitution({ id: 'u', name: 'U', status: 'approved', kind: 'university' });
+      await store.createUser({ username: 'reg', passwordHash: await hashPassword('registrar1'), role: 'institution', institutionId: 'u' });
+      app = createApp({
+        chain: ledger.bridge(AUTHORITY),
+        connect: (k) => ledger.bridge(k),
+        ledger,
+        walletKey: TEST_WALLET_KEY,
+        store,
+        auth: createAuth({ jwtSecret: 'test-secret', store }),
+        institutionName: 'U',
+        rateLimits: false,
+      });
+      token = (await request(app).post('/api/auth/login').send({ username: 'reg', password: 'registrar1' })).body.token;
+    });
+
+    it('can retry an issue whose database save failed', async () => {
+      failOnce('insert');
+      const first = await request(app).post('/api/credentials').set(auth()).send(CRED);
+      expect(first.status).to.equal(500);
+      const retry = await request(app).post('/api/credentials').set(auth()).send(CRED);
+      expect(retry.status, JSON.stringify(retry.body)).to.equal(201);
+      expect((await request(app).get(`/api/verify/${CRED.credentialId}`)).body.status).to.equal('valid');
+    });
+
+    it('can retry a revocation whose database save failed', async () => {
+      failOnce('update');
+      const first = await request(app).post(`/api/credentials/${CRED.credentialId}/revoke`).set(auth()).send({ reason: 'Error' });
+      expect(first.status).to.equal(500);
+      expect((await request(app).get(`/api/verify/${CRED.credentialId}`)).body.status).to.equal('revoked');
+      const retry = await request(app).post(`/api/credentials/${CRED.credentialId}/revoke`).set(auth()).send({ reason: 'Error' });
+      expect(retry.status, JSON.stringify(retry.body)).to.equal(200);
+      expect((await store.get(CRED.credentialId)).status).to.equal('revoked');
+    });
   });
 });

@@ -155,9 +155,11 @@ export function createApp({
       credentialId: body.credentialId
         ? String(body.credentialId).trim()
         : `COR-${new Date().getFullYear()}-${randomHex(3).toUpperCase()}`,
-      txHash: body.txHash ? String(body.txHash) : '0x' + randomHex(32),
       issuer: issuerName,
     };
+    // The printed reference is derived, not random, so a retried issue rebuilds
+    // exactly the same certificate file and file hash.
+    fields.txHash = body.txHash ? String(body.txHash) : `0x${sha256Hex(`certificate-ref|${fields.credentialId}|${issuerName}`)}`;
     const missing = ['studentName', 'studentId', 'credentialType'].filter((k) => !fields[k]);
     if (missing.length) throw new HttpError(400, `Missing required field(s): ${missing.join(', ')}.`);
     if (['studentName', 'studentId', 'credentialType'].some((k) => fields[k].length > MAX_TEXT)) {
@@ -212,10 +214,12 @@ export function createApp({
     const hash = await computeSha256Hex(buildCertificateBytes(fields));
     const bridge = await institutions.bridgeFor(institution);
     // certHash is over the certificate's data, so a photo of it can be checked too.
-    const receipt = await bridge.issue(fields.credentialId, hash, {
-      certNo: fields.credentialId,
-      certHash: sha256Hex(issuedCanonical(fields)),
-    });
+    const receipt =
+      (await issuedEarlier(fields.credentialId, hash, institution)) ??
+      (await bridge.issue(fields.credentialId, hash, {
+        certNo: fields.credentialId,
+        certHash: sha256Hex(issuedCanonical(fields)),
+      }));
     const record = await store.insert({
       ...fields,
       ...extra,
@@ -235,6 +239,25 @@ export function createApp({
     return { credentialId: record.credentialId, hash, txHash: record.txHash, qrPayload: record.credentialId, record };
   }
 
+  // An earlier attempt can reach the chain and then fail to save the record.
+  // A retry with the same certificate finishes the save; anything else is a duplicate.
+  async function issuedEarlier(credentialId, hash, institution) {
+    const onChain = await chain.getById(credentialId);
+    if (!onChain) return null;
+    const sameIssuer = onChain.issuer?.toLowerCase() === institution.walletAddress?.toLowerCase();
+    if (onChain.hash !== hash || !sameIssuer || onChain.status !== 'valid') {
+      throw new HttpError(409, `Credential ID "${credentialId}" already exists on the blockchain.`);
+    }
+    return { txHash: onChain.txId ? `0x${onChain.txId}` : null, blockNumber: onChain.block ?? null, gasUsed: 0 };
+  }
+
+  async function revokedEarlier(record) {
+    if (record.batch) return null;
+    if ((await chain.getById(record.credentialId))?.status !== 'revoked') return null;
+    const event = (await chain.history(record.credentialId)).findLast((e) => e.type === 'revoked');
+    return { txHash: event?.txHash ?? null, blockNumber: event?.blockNumber ?? null, gasUsed: 0 };
+  }
+
   async function revoke(req, credentialId, reasonInput) {
     const record = await store.get(credentialId);
     if (!record) throw new HttpError(404, 'Credential not found.');
@@ -245,9 +268,11 @@ export function createApp({
     if (record.status === 'revoked') throw new HttpError(409, 'Credential is already revoked.');
     const reason = String(reasonInput ?? '').trim().slice(0, 500) || 'No reason provided.';
     const bridge = await institutions.bridgeFor(await institutionOf(record));
-    const receipt = record.batch
-      ? await bridge.revokeBatch({ ...record.batch, credentialId, hash: record.hash }, reason)
-      : await bridge.revoke(credentialId, reason);
+    const receipt =
+      (await revokedEarlier(record)) ??
+      (record.batch
+        ? await bridge.revokeBatch({ ...record.batch, credentialId, hash: record.hash }, reason)
+        : await bridge.revoke(credentialId, reason));
     return store.update(credentialId, {
       status: 'revoked',
       revocation: {
