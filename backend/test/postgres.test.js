@@ -56,6 +56,15 @@ const STUDENT = {
     token = await login(app, 'registrar.admin', 'admin12345');
   });
 
+  it('fails a query that hangs, instead of waiting forever', async () => {
+    process.env.DATABASE_QUERY_TIMEOUT_MS = '300';
+    const quick = await createPgStore(scopedUrl()).finally(() => delete process.env.DATABASE_QUERY_TIMEOUT_MS);
+    let error = null;
+    await quick.raw('SELECT pg_sleep(2)').catch((e) => (error = e));
+    await quick.close();
+    expect(error?.message).to.match(/timeout/i);
+  });
+
   it('applies migrations once and records them', async () => {
     await createPgStore(scopedUrl()).then((s) => s.close()); // second run is a no-op
     const { rows } = await admin.query(`SELECT name FROM ${schema}.schema_migrations`);

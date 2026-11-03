@@ -284,6 +284,8 @@ export async function createPgStore(connectionString, { ssl } = {}) {
     ssl,
     max: Number(process.env.DATABASE_POOL_MAX || 10),
     connectionTimeoutMillis: 30_000,
+    // A database that stops answering must give an error, not a request that hangs.
+    query_timeout: Number(process.env.DATABASE_QUERY_TIMEOUT_MS || 20_000),
     // Hosted poolers (Supabase Supavisor, PgBouncer) close idle connections on
     // their side; keep sockets alive and retire idle clients before that happens.
     keepAlive: true,
