@@ -58,8 +58,17 @@ describe('Integrity', () => {
     expect(error?.name).to.equal('ChainUnavailableError');
   });
 
+  it('reports the chain as unavailable, never VALID, when block storage is down', async () => {
+    const ledgerStore = createMemoryLedgerStore();
+    await createLedger(options(ledgerStore, 's')).bridge(AUTHORITY).issue('S-1', hash('s1'));
+    const down = { ...ledgerStore, heights: async () => { throw new Error('connection refused'); }, load: async () => { throw new Error('connection refused'); } };
+    let error = null;
+    await createLedger(options(down, 's')).bridge(AUTHORITY).getById('S-1').catch((e) => (error = e));
+    expect(error?.name).to.equal('ChainUnavailableError');
+  });
+
   describe('database failure after the chain write', () => {
-    let app, store, token;
+    let app, store, token, ledger;
     const CRED = { studentName: 'Asha Rao', studentId: 'AU1', credentialType: 'B.Tech', issueDate: '2026-06-15', credentialId: 'COR-2026-INT001' };
     const auth = () => ({ Authorization: `Bearer ${token}` });
     const failOnce = (name) => {
@@ -72,7 +81,7 @@ describe('Integrity', () => {
 
     before(async () => {
       store = createMemoryStore();
-      const ledger = createLedger(options(createMemoryLedgerStore(), 'd'));
+      ledger = createLedger(options(createMemoryLedgerStore(), 'd'));
       await store.createInstitution({ id: 'u', name: 'U', status: 'approved', kind: 'university' });
       await store.createUser({ username: 'reg', passwordHash: await hashPassword('registrar1'), role: 'institution', institutionId: 'u' });
       app = createApp({
@@ -95,6 +104,25 @@ describe('Integrity', () => {
       const retry = await request(app).post('/api/credentials').set(auth()).send(CRED);
       expect(retry.status, JSON.stringify(retry.body)).to.equal(201);
       expect((await request(app).get(`/api/verify/${CRED.credentialId}`)).body.status).to.equal('valid');
+    });
+
+    it('still rejects an ID that is on the chain for a different certificate', async () => {
+      await ledger.bridge(AUTHORITY).issue('COR-2026-INT002', `0x${'ab'.repeat(32)}`);
+      const res = await request(app).post('/api/credentials').set(auth()).send({ ...CRED, credentialId: 'COR-2026-INT002' });
+      expect(res.status, JSON.stringify(res.body)).to.equal(409);
+    });
+
+    it('reports an error, never VALID, when the database is down during verification', async () => {
+      for (const route of [`/api/verify/${CRED.credentialId}`]) {
+        failOnce('get');
+        const res = await request(app).get(route);
+        expect(res.status, route).to.equal(500);
+        expect(res.body.status, route).to.not.equal('valid');
+      }
+      failOnce('findDegreeRecord');
+      const photo = await request(app).post('/api/verify/photo').send({ ocrText: `Certificate No: ${CRED.credentialId}\nName: Asha Rao\n` });
+      expect(photo.status).to.equal(500);
+      expect(photo.body.verdict).to.equal(undefined);
     });
 
     it('can retry a revocation whose database save failed', async () => {

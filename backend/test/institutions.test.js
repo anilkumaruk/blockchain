@@ -183,6 +183,7 @@ describe('Institutions and student accounts', () => {
       // A token issued before suspension can no longer issue either.
       const blocked = await request(app).post('/api/credentials').set(as(token)).send(credential({ studentId: 'RV21CS009' }));
       expect(blocked.status).to.equal(403);
+      expect(blocked.body.error).to.match(/suspended/); // refused by the platform, before reaching the chain
     });
   });
 
