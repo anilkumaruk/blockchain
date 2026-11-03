@@ -1,11 +1,11 @@
 {
   "network": "sepolia",
   "chainId": 11155111,
-  "address": "0xA34BE0F943de87b2414da6Ea44A49c2bb8d5B37a",
+  "address": "0x2E36EB891D77c7f9dE0BC1b00D17ECb00f37D15E",
   "owner": "0xD5E2E1123700Af43EDbAa94dc1b9e30EaE8ae231",
-  "institution": "Alliance University",
-  "deployTx": "0x27f2a867a05e58931a883ddca72587e382c3e41b08c67af09358384d6095ec63",
-  "blockNumber": 11982575,
+  "platform": "Chain of Record platform",
+  "deployTx": "0x2ac18effe71f220a88327f4bcf2634f2d2addc47f1fab54703e60603a003e5fe",
+  "blockNumber": 12054016,
   "abi": [
     {
       "inputs": [

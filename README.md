@@ -3,236 +3,169 @@
 E1CSA313 Design Project-1, Alliance University  
 Team: Manu M P, Tarun Kumar S, Anilkumar U K, Pruthviraj D N · Mentor: Dr. Saravanan P
 
-A blockchain-backed verification layer on top of a university's academic records.
-At issuance, the SHA-256 fingerprints of each certificate and its marks are recorded on
-the project's own blockchain, whose latest block is anchored to a Solidity contract on
-Sepolia. Anyone can then verify a marks card from a photo, QR code or credential ID.
+A decentralised application (DApp) for issuing and verifying academic credentials, built to
+the project brief (Ministry of Education / UGC problem statement): a smart contract on
+Ethereum manages issuance and revocation, universities sign in MetaMask, encrypted documents
+live on IPFS, and a QR code lets anyone verify a certificate.
 
 - Website: https://blockchain-ecru-three.vercel.app
+- Smart contract: `CredentialRegistry` on Ethereum Sepolia, `0x2E36EB891D77c7f9dE0BC1b00D17ECb00f37D15E`
+- How it works, step by step: [docs/Blockchain_In_Our_Application.pdf](docs/Blockchain_In_Our_Application.pdf)
 
 ## What it does
 
 **Input: a photo of a certificate. Output: VALID, INVALID or REVOKED.**
 
-The blockchain is the project's own, written from scratch in `backend/blockchain/`: blocks with SHA-256 hash links, Merkle trees, ECDSA-signed transactions, proof of work and majority voting among 3 validator nodes. Each verification asks all 3 nodes, needs a majority, and walks the links from the certificate's block to the latest block.
+| Part of the brief | Where |
+|---|---|
+| Smart contracts manage credential issuance and revocation | `backend/contracts/CredentialRegistry.sol` on Ethereum Sepolia |
+| Issuer dashboard for universities | Credential Center (`/admin`): issue one, issue a Merkle batch, revoke; every write signed in MetaMask |
+| Student wallet / mobile app | Student Portal (`/student`), installable on a phone (PWA); holds each certificate's QR and key |
+| Verifier portal for employers | `/verify`: certificate photo, QR scan, credential ID |
+| IPFS stores encrypted documents | Each marks card is encrypted (AES-256-GCM) and pinned to IPFS through Pinata |
+| QR verification without central servers | The QR link holds the IPFS address and key after `#`; the browser checks IPFS and Ethereum directly |
+| Self-sovereign control | Only the student's QR carries the key; the student decides who can read the document |
+| Integration with university systems via APIs | REST API below |
 
-- Explain it: [docs/BLOCKCHAIN_VIVA_GUIDE.md](docs/BLOCKCHAIN_VIVA_GUIDE.md)
-- See it: the **Blockchain** page (`/chain`), or `cd backend && npm run chain:demo`
-- Measure it: `cd backend && npm test`, `npm run chain:evaluate`, `npm run chain:photos`
-- Every file and workflow: [docs/Project_File_Guide.pdf](docs/Project_File_Guide.pdf)
-
-## Architecture
+## How a certificate is recorded and checked
 
 ```
-React (Vite) ──REST──▶ Node.js + Express ──▶ own blockchain (backend/blockchain)
- Verify (photo/QR/ID)   JWT + roles, helmet,    3 validator nodes, majority 2 of 3,
- Credential Center      rate limits, audit log  each node's copy stored in PostgreSQL
- Student Portal                     │                     │ newest block hash
- Blockchain page                    ▼                     ▼
-                        PostgreSQL (records,     CredentialRegistry.sol on Sepolia
-                        users, audit log)        anchorBatch(head hash)
+University (MetaMask) ──signs──▶ CredentialRegistry (Ethereum Sepolia) ◀──reads── Verifier
+        │                          issueCredential / anchorBatch                  │
+        │                          revokeCredential / setIssuer                   │
+        ▼                                                                         │
+  API server (no keys) ── prepares the docHash, confirms each write by reading ───┘
+        │                 the contract, verifies photos
+        ▼
+  PostgreSQL (personal data)          IPFS (encrypted marks cards)
 ```
 
-No blockchain node or wallet has to run: the chain lives in the database. With
-`CHAIN_NETWORK=sepolia` each new block's hash is also anchored on Ethereum Sepolia,
-and the Blockchain page reads that anchor directly from Sepolia.
+1. **Hash.** The server builds the certificate's document: its canonical line
+   (`cert_no|reg_no|NAME|dob|program|score|year|univ`) plus every semester row. Its SHA-256 is the **docHash**.
+2. **Sign.** The registrar signs `issueCredential(id, docHash)` in MetaMask, or `anchorBatch(root, count)`
+   for a Merkle root covering many certificates.
+3. **Mine.** Ethereum puts the transaction in a block; each block stores its parent block's hash.
+4. **Confirm.** The server reads the contract back (this ID, this hash, signed by this university's
+   address) before saving anything. It then encrypts the document and pins it to IPFS.
+5. **Verify.** Anyone reads the contract: is this exact hash there, from an authorised issuer, and not revoked?
 
-## Blockchain features
+The server never holds a private key. The platform admin (contract owner) authorises
+universities with `setIssuer`, also in MetaMask.
 
-| Feature | What it does | Code |
-|---|---|---|
-| Hash-linked blocks | Each block stores the previous block's SHA-256 hash, a Merkle root of its transactions and a proof-of-work nonce | `blockchain/block.js`, `merkle.js` |
-| Signed transactions | `GENESIS`, `SET_ISSUER`, `ISSUE`, `REVOKE`, `SET_PAUSED`, each signed with ECDSA secp256k1 by its sender | `blockchain/transaction.js` |
-| Consensus | Proof of authority: 3 validators re-check every block and sign it; 2 of 3 signatures commit it | `blockchain/network.js`, `node.js` |
-| Rules | Only authorised universities issue; only the issuer revokes; no duplicate ID or hash; pause stops writes | `blockchain/state.js` |
-| Verified storage | Every signature is re-checked when blocks are loaded from the database; a corrupted copy loses its vote and can be repaired | `server/ledger.js` |
-| Majority reads | Each verification asks all 3 nodes and needs 2 matching answers, then walks the links to the newest block | `server/ledger.js` |
-| Revocation | A new `REVOKE` transaction; the issue record is never deleted | `blockchain/state.js` |
-| Public anchor | The newest block hash is written to `CredentialRegistry.anchorBatch` on Sepolia | `server/anchor.js` |
+## Accounts
 
-The Solidity contract also contains the earlier per-credential and Merkle-batch
-functions, emergency pause and two-step ownership; they stay fully tested
-(`test/CredentialRegistry.test.js`, `batch.test.js`, `contract-reverts.test.js`)
-but the running system uses only `anchorBatch`.
-
-See [SECURITY.md](SECURITY.md) for the threat model and all security controls.
-
-## Accounts: institutions and students
-
-- **Platform admin** (`platform.admin`, the first account the server creates) belongs to no
-  university. It approves or suspends institutions and runs the registry controls (pause, audit
-  log), but cannot see, issue or revoke any university's credentials.
-- **Universities** (Alliance University included) each have registrar accounts that issue, revoke
-  and view only their own credentials, signed on-chain with their own issuer wallet.
-- **Institutions** register at `/register/institution` and stay *pending* until the admin approves them.
-  Approval creates the institution's own signing key (encrypted with `WALLET_ENCRYPTION_KEY`) and
-  authorises it on the chain with a `SET_ISSUER` transaction. Its credentials are then recorded
-  under its own address. Suspending it makes them fail verification (`untrusted_issuer`).
-- **Students** sign in at `/student` with their personal email. They can create an account only for an
-  email their institution has on record (entered as "Student personal email" when issuing), and see
-  only their own credentials.
+- **Platform admin** (`platform.admin`, the first account the server creates) signs as the contract
+  owner: approves or suspends institutions (`setIssuer`) and pauses the registry. It cannot issue.
+- **Universities** each have registrar accounts and a MetaMask address. They issue, revoke and view only
+  their own credentials; the contract also refuses a revocation by anyone but the original issuer.
+- **Institutions** register at `/register/institution` with their MetaMask address and stay *pending*
+  until the platform admin authorises that address in the contract.
+- **Students** sign in at `/student` with their personal email (only one their university has on record).
 
 ## Dataset: Karnataka Degree Registry
 
-`backend/data/karnataka` holds the dataset (17 universities, 2,000 students, 1,604 degree certificates,
-666 labelled verification requests). `npm run import:karnataka` loads it and records every certificate
-on the chain. Test logins are written to `backend/data/karnataka/TEST_LOGINS.md`, which is not committed.
+`backend/data/karnataka`: 17 universities, 2,000 students, 1,604 degree certificates, 666 labelled
+verification requests (synthetic). `npm run import:karnataka` gives each university a test wallet,
+authorises it, and has each university sign **one Merkle batch** for its certificates (17 batches);
+86 certificates are then revoked by their own university. Test logins and the universities' MetaMask
+test keys are written to `TEST_LOGINS.md` / `TEST_WALLETS.json` there (git-ignored).
 
-| Data | Where | Why |
-|---|---|---|
-| Certificate number, SHA-256 of the certificate data, of the certificate file and of the semester marks, issuer address, status | On-chain | Tamper-evident; no personal data |
-| Student name, ID, marks, dates, revocation reason text | Off-chain (PostgreSQL) | Privacy; only `keccak256(reason)` goes on-chain |
-| Certificate PDF and marks card | Generated deterministically from the record | Re-hashing must reproduce the on-chain hash |
+| Data | Where |
+|---|---|
+| docHash (or Merkle root), issuer address, issued / revoked time, status | Smart contract on Ethereum |
+| Names, marks, dates, revocation reason text, users, audit log | PostgreSQL (Supabase), Row Level Security on |
+| The marks card document, encrypted | IPFS (Pinata) |
+| The key to that document | Only in the student's QR code (and the database, so the student can download it again) |
 
-The **chain is the source of truth** for hash and status. The off-chain record is
-cross-checked against it on every verification, so tampering with the database
-is detected too (`record_mismatch`, `hash_mismatch`, `marks_hash_mismatch`).
-
-## Repository layout
-
-```
-src/                    Website (React): pages/, components/, lib/
-  pages/VerificationUI.jsx      Verify a certificate photo, QR or ID
-  pages/ChainExplorer.jsx       Blockchain page: blocks, nodes, tamper demo
-  lib/certificateSvg.js         Student marks card design
-  lib/photoEvidence.js          Reads the photo in the browser (QR + OCR)
-public/                 Sample certificate photos and the OCR engine files
-api/index.js            Vercel entry point for the backend
-backend/
-  blockchain/           The project's own blockchain (blocks, Merkle, signatures, consensus)
-  server/               Express API: app.js, ledger.js, photoVerify.js, anchor.js, store.js, auth.js
-  server/migrations/    Database schema (SQL)
-  contracts/            Solidity contract on Sepolia (anchors the chain head)
-  data/karnataka/       The dataset
-  scripts/              Import, reset, chain demo/repair/checkpoint, evaluation
-  test/                 Automated tests
-  results/              Measured results (verification, photo OCR)
-docs/BLOCKCHAIN_VIVA_GUIDE.md   How the blockchain works, for the viva
-archive/                Old and unused files, kept for reference only
-```
-
-Folders created by tools, not edited by hand: `node_modules/`, `dist/`, `backend/artifacts/`, `backend/cache/`.
-
-## Running the full stack locally
+## Running locally
 
 ```bash
-# 1. Backend dependencies
 cd backend && npm install --legacy-peer-deps
-
-cp .env.example .env      # then set ADMIN_PASSWORD and JWT_SECRET
-
-# 2. PostgreSQL in Docker
-npm run db:up
-
-# 3. Start the API (terminal 1): runs migrations, creates block 0 and the
-#    platform admin, http://localhost:4000
-npm start
-
-# 4. Load the dataset onto the chain (terminal 2); writes the test logins to
-#    data/karnataka/TEST_LOGINS.md (not committed)
-npm run import:karnataka
-
-# 5. Website against the real backend (terminal 3, repo root)
-npm install
-VITE_API_URL=http://localhost:4000 npm run dev
+cp .env.example .env          # set ADMIN_PASSWORD and JWT_SECRET
+npm run db:up                 # PostgreSQL in Docker
+npm run chain                 # terminal 1: local Ethereum (Hardhat) on 127.0.0.1:8545
+npm run deploy:local          # terminal 2: deploys CredentialRegistry
+npm start                     # API on http://localhost:4000 (CHAIN_NETWORK=localhost)
+npm run import:karnataka      # dataset into the contract and the database
+cd .. && npm install
+VITE_API_URL=http://localhost:4000 VITE_CHAIN_NETWORK=localhost npm run dev
 ```
 
-No Hardhat node and no contract deployment are needed. Sign in to the Credential
-Center as a university admin from `TEST_LOGINS.md` to issue and revoke; the
-`platform.admin` account (password `ADMIN_PASSWORD`) approves universities but cannot issue.
-More accounts: `npm run create-user -- <username> <admin|student> [studentId]`
-(prompts for the password, stores an scrypt hash).
-Without `VITE_API_URL` the website runs an in-browser mock whose results are
-simulated (the banner says so); a Vercel production build refuses to run without it.
+In MetaMask, add the network `http://127.0.0.1:8545` (chain id 31337), import Hardhat account #0 for
+the platform admin and a university key from `TEST_WALLETS.json` for a registrar.
 
-**Supabase database:**
+**Sepolia (the live setup):** `npm run deploy:sepolia` (needs `DEPLOYER_PRIVATE_KEY` and
+`SEPOLIA_RPC_URL` in `.env`, test ETH only), then start the API with `CHAIN_NETWORK=sepolia`. The
+deployer key is used only by the deploy and import scripts on your machine, never by the server.
+Set `PINATA_JWT` to store encrypted documents on IPFS.
 
-1. In Supabase, open **Connect** and copy the **Session pooler** connection string.
-   The direct `db.<ref>.supabase.co` host is IPv6-only and fails on most home networks.
-2. Under **Project Settings → Database → SSL Configuration**, download the CA certificate
-   and save it as `backend/certs/prod-ca-2021.crt`. The `certs/` folder is git-ignored.
-3. In `backend/.env`, set:
-   ```
-   DATABASE_URL=postgresql://postgres.<project-ref>:<db-password>@aws-0-<region>.pooler.supabase.com:5432/postgres
-   DATABASE_SSL_CA=certs/prod-ca-2021.crt
-   ```
-4. Run `npm run db:check`. It connects over verified TLS, runs the migrations and
-   shows that Row Level Security is on for every table.
-
-Migration `002` enables Row Level Security and revokes access for the `anon` and
-`authenticated` roles. Supabase's public REST API then can't read student records,
-password hashes or the audit log, even with the project's public anon key. Only this
-API server, which connects as the database owner, can access the tables.
-
-Other hosted Postgres (Neon, RDS): set `DATABASE_URL` and `DATABASE_SSL=true`.
-
-**Sepolia anchor:** the contract is already deployed (`backend/deployments/sepolia.json`).
-Start the API with `CHAIN_NETWORK=sepolia`, `SEPOLIA_RPC_URL` and `ISSUER_PRIVATE_KEY`
-(a fresh wallet funded only with Sepolia test ETH) and each new block's hash is anchored;
-`npm run chain:checkpoint` anchors the current head on demand. Never commit `.env`.
-To deploy a new contract: set `DEPLOYER_PRIVATE_KEY` and run `npm run deploy:sepolia`.
-
-**Production** (`NODE_ENV=production`): the server refuses to start without a
-database, a ≥32-character `JWT_SECRET`, a `CORS_ORIGIN` allowlist and a real issuer key.
+**Supabase:** use the Session pooler connection string, save the CA certificate as
+`backend/certs/prod-ca-2021.crt`, set `DATABASE_SSL_CA=certs/prod-ca-2021.crt`, run `npm run db:check`.
 
 ## REST API
 
-| Method | Path | Role | Purpose |
+| Method | Path | Who | Purpose |
 |---|---|---|---|
-| POST | `/api/auth/login` | – | Email or username; returns a JWT (`admin`, `institution` or `student`) |
-| POST | `/api/auth/register/student` | – | Student account for an email an institution has on record |
-| POST | `/api/institutions/register` | – | Institution application (pending until approved) |
-| GET | `/api/institutions` | – | Public directory of approved issuers |
-| GET | `/api/me` | signed in | Own profile |
-| GET | `/api/me/certificates`, `/api/me/credentials` | student | Own certificates, with marks card data |
-| GET | `/api/admin/institutions` | platform admin | All institutions |
-| POST | `/api/admin/institutions/:id/approve` · `reject` · `suspend` | platform admin | Institution lifecycle (approve creates and authorises its signing key) |
-| POST | `/api/credentials` | university | Hash the certificate, record it on the chain under the university's key, store the record (optional `studentEmail`) |
-| POST | `/api/credentials/batch` | university | Up to 500 credentials, 25 transactions per block |
-| GET | `/api/credentials` | university | Own university's records |
-| GET | `/api/credentials/:id/certificate` | university | Marks card data for an own certificate |
-| POST | `/api/credentials/:id/revoke` | university (issuer only) | `REVOKE` transaction (no deletion) |
-| POST | `/api/credentials/:id/reissue` | university (issuer only) | Revoke + issue corrected credential, linked both ways |
-| GET | `/api/credentials/:id`, `/api/credentials/:id/history` | – | Public record and issue/revoke trail |
-| GET | `/api/admin/audit` | platform admin | Audit log (logins, failed logins, issue, revoke, pause) |
-| GET | `/api/admin/registry` | platform admin | Chain id, authority, platform issuer, paused state |
-| POST | `/api/admin/pause` | platform admin | Emergency stop / resume (`{ "paused": true }`) |
-| GET | `/api/students/:studentId/credentials` | – | Shared student profile |
+| POST | `/api/auth/login` | – | Sign in; returns a JWT |
+| POST | `/api/auth/register/student` | – | Student account for an email on record |
+| POST | `/api/institutions/register` | – | Institution application with its MetaMask address |
+| GET | `/api/institutions` | – | Approved institutions |
+| POST | `/api/credentials/prepare` | university | The docHash to sign in MetaMask |
+| POST | `/api/credentials` | university | Record an issue the contract confirms (ID, hash, issuer, transaction) |
+| POST | `/api/credentials/batch/prepare` · `/api/credentials/batch` | university | Merkle root to sign; record the batch the contract confirms |
+| POST | `/api/credentials/:id/revoke` | university (issuer) | Record a revocation the contract shows, with the same reason hash |
+| GET | `/api/credentials`, `/api/credentials/:id/certificate` | university | Own records; marks card data |
+| GET | `/api/me`, `/api/me/certificates` | signed in / student | Own profile; marks cards with QR data |
 | POST | `/api/verify/photo` | – | Text and QR read from a certificate photo → valid / invalid / revoked |
-| GET | `/api/verify/:credentialId` | – | Verify by ID, certificate number or QR |
-| POST | `/api/verify/hash`, `/api/verify/file` | – | Verify a SHA-256, or an uploaded PDF (server recomputes the hash) |
-| GET | `/api/chain/summary`, `/api/chain/blocks`, `/api/chain/blocks/:index` | – | Blockchain explorer |
-| GET | `/api/chain/audit` | – | Re-validate every node from block 0 |
-| POST | `/api/chain/simulate-tamper` | – | Tamper demonstration on a throwaway copy |
-| GET | `/api/health` | – | Chain + store status |
+| GET | `/api/verify/:id` · POST `/api/verify/hash` | – | Verify by ID, certificate number or docHash |
+| GET | `/api/credentials/:id/history` | – | Issue / batch / revoke events from the contract |
+| GET | `/api/admin/institutions` · POST `…/:id/approve`·`suspend`·`reject` | platform admin | Confirm a `setIssuer` signed in MetaMask |
+| GET | `/api/admin/registry`, `/api/admin/audit` · POST `/api/admin/pause` | platform admin | Contract status, audit log, record a pause signed in MetaMask |
+| GET | `/api/health` | – | Contract, database and IPFS status |
 
-Verification by ID, hash or file returns `status` (`valid` / `revoked` / `invalid`) and a
-`code` (`not_found`, `hash_mismatch`, `untrusted_issuer`, `record_mismatch`). Photo
-verification returns `verdict` and a `code` listed in `docs/BLOCKCHAIN_VIVA_GUIDE.md`.
-When the chain has no majority answer, or the database does not answer, the API returns
-an error (503 / 500), never a verdict.
+If Ethereum or the database does not answer, the API returns an error (503 / 500), never a verdict.
 
 ## Testing and evaluation
 
 ```bash
 cd backend
-npm test                # 117 tests: own chain, integrity, contract, security, scenarios
+npm test                # 92 tests: contract, API on Hardhat's Ethereum, photo, IPFS, security
 npm run test:db         # + 7 PostgreSQL integration tests (needs npm run db:up)
 npm run coverage        # Solidity coverage
-npm run coverage:js     # server and chain coverage
-npm run chain:evaluate  # 666 labelled verification requests
-npm run chain:photos    # simulated certificate photos (OCR + QR)
+npm run chain:evaluate  # 666 labelled verification requests against the contract
+npm run chain:photos    # simulated certificate photos (OCR + QR) against the contract
 ```
 
-| # | Scenario | Expected | Automated test |
-|---|---|---|---|
-| 1 | Valid credential | Verified | ✔ |
-| 2 | Modified certificate (1-character edit) | Hash mismatch | ✔ |
-| 3 | Unknown credential ID | Not found | ✔ |
-| 4 | Revoked credential | Revoked | ✔ |
-| 5 | Credential from an untrusted issuer | Verification failed | ✔ |
-| 6 | Duplicate credential ID | Rejected (API 409 + contract revert) | ✔ |
-| 7 | Non-admin issuance | Access denied (401/403) | ✔ |
-| 8 | Blockchain unreachable | Unavailable (503, never a false pass) | ✔ |
-| 9 | Non-PDF / empty upload | File rejected (415) | ✔ |
-| 10 | Correction: old revoked, new issued | New credential valid | ✔ |
+| Measure | Result |
+|---|---|
+| Automated tests | 92 passing; 99 with the database tests |
+| Labelled verification requests | 666 / 666 |
+| Simulated photos (42 per quality level) | clean 42/42 · phone-like 42/42 · poor (small, blurred) 39/42 |
+
+## Repository layout
+
+```
+src/                     Website: pages/, components/, lib/
+  lib/wallet.js          MetaMask: every transaction is signed here
+  lib/chainVerify.js     Browser-only check: IPFS + Ethereum, no server
+  lib/certificateSvg.js  Marks card with QR
+public/                  Sample photos, OCR engine, PWA manifest and service worker
+api/index.js             Vercel entry point for the API
+backend/
+  contracts/             CredentialRegistry.sol (the smart contract)
+  deployments/           Contract address and ABI per network
+  server/                API: app.js, chain.js (contract reads), photoVerify.js, ipfs.js, hash.js
+  scripts/               deploy, import, evaluation, sample photos, db tools
+  test/                  Automated tests
+docs/                    Guides and the blockchain PDF
+archive/                 Retired files, including the team's earlier own blockchain
+```
+
+## Known limits
+
+- The live network is **Sepolia**, Ethereum's public test network: real blocks and consensus, test ETH.
+- The **server and database are central** parts: personal data, photo checks and confirmations run there.
+  The contract, IPFS and the QR check do not depend on it.
+- The **student app is a PWA**, not a Flutter app; Hyperledger is not used (the brief lists both as options).
+- **OCR**: only this system's marks-card layout is read; photo accuracy was measured on simulated photos only.
+- The dataset is **synthetic**; certificates say "Not an official university document".

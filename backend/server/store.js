@@ -360,6 +360,10 @@ export async function createPgStore(connectionString, { ssl } = {}) {
     // All-or-nothing: a batch is either fully recorded or not at all.
     async insertMany(records) {
       const client = await pool.connect();
+      // A connection dropped mid-transaction must fail this call, not crash the process.
+      const onError = (err) => console.error('[db] connection lost during insertMany:', err.message);
+      client.on('error', onError);
+      let broken = null;
       try {
         await client.query('BEGIN');
         const out = [];
@@ -367,10 +371,12 @@ export async function createPgStore(connectionString, { ssl } = {}) {
         await client.query('COMMIT');
         return out;
       } catch (err) {
-        await client.query('ROLLBACK');
+        broken = err;
+        await client.query('ROLLBACK').catch(() => {});
         throw err;
       } finally {
-        client.release();
+        client.off('error', onError);
+        client.release(broken && isConnectionError(broken) ? broken : undefined);
       }
     },
     async update(credentialId, patch) {

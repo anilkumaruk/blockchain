@@ -18,7 +18,7 @@ import { ChainUnavailableError, ContractRevertError } from './chain.js';
 import { buildMerkleTree, leafOf } from './merkle.js';
 import { verifyCertificateEvidence } from './photoVerify.js';
 import { documentHash } from './hash.js';
-import { chainIdOf, degreeCanonical, issuedCanonical, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
+import { chainIdOf, issuedCanonical, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
 import { createInstitutionService } from './institutions.js';
 import { hashPassword } from './passwords.js';
 

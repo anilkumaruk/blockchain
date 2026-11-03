@@ -1,159 +1,166 @@
 # Chain of Record: how the blockchain works (viva guide)
 
 Every answer below points to code you can open and a screen you can show.
-Show it live: **Blockchain** page (`/chain`), **Employer / Verifier → Certificate Photo** (`/verify`), and in a terminal `cd backend && npm run chain:demo`.
+Show it live: **Blockchain** page (`/chain`), **Employer / Verifier → Certificate Photo** (`/verify`),
+and the contract on Etherscan: https://sepolia.etherscan.io/address/0x2E36EB891D77c7f9dE0BC1b00D17ECb00f37D15E
 
 ## 1. What the project does
 
 Input: a photo of a certificate. Output: **VALID**, **INVALID** or **REVOKED**.
 
 ```
-Photo → read QR + text (OCR) → find the certificate number on the blockchain
-      → issuer authorised? → printed details match the university's record?
-      → record hashes to the value on the chain? → marks hash to the value on the chain?
-      → every node asked, majority must agree → walk the links from that block to the head
-      → status on the chain
+Photo → read QR + text in the browser (OCR) → certificate number
+      → ask the smart contract: is this credential recorded? by an authorised issuer?
+      → printed details match the university's record?
+      → the record + every semester row hash (SHA-256) to the docHash in the contract?
+      → QR hash equals that docHash?
+      → revoked in the contract?
 ```
 
-Code: `backend/server/photoVerify.js`, `src/lib/photoEvidence.js`.
+Code: `backend/server/photoVerify.js`, `src/lib/photoEvidence.js`, `backend/server/chain.js`.
 
-**Why not hash the photo?** Two photos of one certificate have different pixels, so their hashes never match. So we hash the certificate's *data* (the canonical string), not the file:
+**Why not hash the photo?** Two photos of one certificate have different pixels, so their hashes never
+match. We hash the certificate's *data*:
 
-`cert_no|reg_no|NAME|dob|program_code|score|year|univ_id` → SHA-256
+`docHash = SHA-256( cert_no|reg_no|NAME|dob|program|score|year|univ  +  every semester row )`
 
-The semester table has its own `marksHash` on the `ISSUE` transaction, so changing one SGPA on the marks card is caught too. If a table is present, every row must be read; a row that cannot be read gives INVALID ("could not read"), never VALID.
+Changing one SGPA changes the docHash, so the contract no longer holds it → INVALID. If a semester table
+is present, every row must be read; a row that cannot be read gives INVALID ("could not read"), never VALID.
 
-## 2. "How are blocks implemented?"
+## 2. "Which blockchain is it?"
 
-We wrote the blockchain ourselves in `backend/blockchain/` (about 560 lines). It does not run on Ethereum or any other chain.
+**Ethereum**, on its public test network **Sepolia** (chain id 11155111). It is a real blockchain: thousands
+of independent nodes, Proof of Stake consensus, a new block every 12 seconds. Test ETH has no money value;
+that is the only difference from Ethereum mainnet.
 
-A block (`block.js`) has:
+Our part of it is one **smart contract**, `backend/contracts/CredentialRegistry.sol`, deployed at
+`0x2E36EB891D77c7f9dE0BC1b00D17ECb00f37D15E` in block 12,054,016.
 
-| Field | Purpose |
+| Function | Who may call it | What it does |
+|---|---|---|
+| `setIssuer(address, name, active)` | Contract owner (platform admin) | Authorise or suspend a university's wallet |
+| `issueCredential(id, docHash)` | Authorised university | Record one certificate |
+| `anchorBatch(root, count)` | Authorised university | Record many certificates under one Merkle root |
+| `revokeCredential` / `revokeBatchCredential` | Only the university that issued it | Mark it revoked, with `keccak256(reason)` |
+| `getCredential`, `verifyBatchCredential` | Anyone, free | Read status, issuer and whether the issuer is still active |
+| `pause()` / `unpause()` | Owner | Emergency stop for issuing and revoking; verifying still works |
+
+The contract refuses bad writes itself: `NotAuthorizedIssuer`, `CredentialAlreadyExists`,
+`HashAlreadyRegistered`, `NotOriginalIssuer`, `AlreadyRevoked`, `RootAlreadyAnchored`, `InvalidProof`.
+
+## 3. "How does a certificate get into a block?"
+
+```
+1. Registrar fills the form      → server builds the document and returns its docHash   (POST /api/credentials/prepare)
+2. Registrar clicks Issue        → MetaMask opens: issueCredential(id, docHash)          (src/lib/wallet.js)
+3. Registrar approves            → MetaMask signs with the university's private key and broadcasts
+4. Ethereum validators           → put the transaction in a block; the block is chained by its parent hash
+5. Website                       → POST /api/credentials with the transaction hash
+6. Server reads the contract     → this ID, this docHash, from this university's address, a successful
+                                   transaction to this contract → only then saves the record
+7. Server encrypts the document  → AES-256-GCM, pins it to IPFS (Pinata); the key goes only into the QR
+```
+
+**The server never holds a private key.** If someone takes over the server, they still cannot issue.
+
+## 4. "How do blocks operate with each other?"
+
+Every Ethereum block header holds the **hash of its parent block**. So:
+
+```
+Change a transaction in an old block → that block's transactions root changes
+→ its block hash changes → the next block's parentHash no longer matches
+→ every later block would have to be rebuilt, and the validators would have to agree
+```
+
+**Show it:** Blockchain page → click a block number in "Latest contract events": it shows the block hash
+and the parent block hash, read straight from Ethereum.
+
+## 5. "Which blocks does a verification check?"
+
+| Check | Read from | Fails as |
+|---|---|---|
+| Credential ID is recorded, with this docHash | Contract storage (`getCredential` / `verifyBatchCredential` + Merkle proof) | `not_on_chain`, `hash_mismatch` |
+| The issuer address is authorised and still active | Contract `issuers` mapping | `untrusted_issuer` |
+| The transaction that recorded it succeeded, was sent to our contract, by that issuer | The transaction receipt and **its block** (number, block hash) | not saved at all |
+| How deep it is | Latest block number − its block number + 1 = **confirmations** | – |
+| Revoked? | Contract status / `revokedAt` | `revoked` |
+
+The verifier's **Proof** section shows network, contract, transaction, block number, block hash,
+confirmations, batch ID, Merkle root and whether the Merkle proof is valid.
+
+## 6. Merkle batches (how 1,604 certificates fit in 17 transactions)
+
+Each university signs **one** `anchorBatch` covering all its certificates:
+
+1. Leaf = `keccak256(keccak256(credentialId, docHash))` (double hash, as OpenZeppelin does, against second-preimage attacks).
+2. Leaves are hashed in pairs up to one **root**. Only the root goes on-chain.
+3. To check one certificate, give its leaf and about log2(n) sibling hashes (the **proof**, ~8 hashes for 150 certificates).
+   The contract recomputes the root (`MerkleProof.verify`) and compares.
+
+## 7. QR code: verification without our server
+
+The QR link is `…/verify/<cert no>/<docHash>#cid=<IPFS address>&k=<key>`. The part after `#` is never sent to any server.
+Scanning it in the website (`src/lib/chainVerify.js`):
+
+1. Download the encrypted document from IPFS (any public gateway).
+2. Decrypt it in the browser with the key from the QR.
+3. Recompute its SHA-256; it must equal the hash in the QR.
+4. Ask Ethereum directly (public RPC): is this hash recorded by an authorised university, and not revoked?
+5. Read the transaction's block: block number and confirmations.
+
+Our API server and database are not used at all.
+
+## 8. Live numbers (Karnataka dataset on Sepolia)
+
+| Item | Count |
 |---|---|
-| `index` | Position in the chain |
-| `previousHash` | Hash of the previous block: **this is the chain** |
-| `merkleRoot` | One hash covering all the block's transactions |
-| `timestamp` | When it was created |
-| `txCount` | Number of transactions (at most 25) |
-| `difficulty`, `nonce` | Proof of work |
-| `proposer` | The node that built it |
+| Universities authorised with `setIssuer` | 17 (+ the platform address, deactivated) |
+| Degree certificates | 1,604, in **17 Merkle batches** (one per university) |
+| Revocations | 86, each its own transaction signed by the issuing university |
+| First batch | block 12,054,064 (VTU, 131 certificates) |
 
-`hash = SHA-256(header)`. Transactions and validator signatures sit beside the header.
-
-A transaction (`transaction.js`) is one signed statement: `GENESIS`, `SET_ISSUER`, `ISSUE`, `REVOKE` or `SET_PAUSED`. Each has an id (SHA-256 of its contents) and an ECDSA secp256k1 signature by its sender.
-
-No names or personal data go on the chain: only certificate numbers, hashes and addresses.
-
-## 3. "How do blocks operate with each other?"
-
-Each block stores the previous block's hash. So:
-
-```
-Edit a transaction → its id no longer matches
-Recompute the id   → the sender's signature fails, and the Merkle root changes
-Update the root    → the header changes, so the block hash changes
-Re-mine the block  → the next block's previousHash no longer matches
-Re-mine every later block → validators never signed those hashes
-```
-
-**Show it:** Blockchain page → *Run the attack*. It performs these four steps on a throwaway copy and shows what the real validation code reports at each one.
-
-## 4. "How many blocks are implemented?"
-
-After importing the Karnataka dataset (open `/chain` for the live count, which grows with every issue or revoke):
-
-| Blocks | Contents |
-|---|---|
-| 0 | Genesis: chain settings, validators, authority |
-| 1–16 | Authorising 16 universities (`SET_ISSUER`) |
-| 17–88 | 1,604 certificates (`ISSUE`, up to 25 per block) |
-| 89–105 | 86 revocations (`REVOKE`) |
-| **106 blocks** | **1,707 transactions** |
-
-Each of the 3 nodes holds its own copy, so the database has 3 × 106 rows.
-
-## 5. Other fundamentals
-
-**Genesis block.** Block 0, with `previousHash` all zeros. It sets the authority address, the validators and the difficulty.
-
-**Merkle tree** (`merkle.js`). Transaction ids are hashed in pairs up to one root. A proof needs about log2(n) hashes, so one certificate can be checked without the rest of the block. The verifier's result shows this proof.
-
-**Proof of work** (`block.js`, `mine`). Try nonces until the hash starts with 3 zeros, about 4,096 attempts on average. This difficulty is low on purpose: it demonstrates the idea and makes rewriting history cost work, but real protection here comes from signatures and consensus.
-
-**Consensus** (`network.js`). Proof of Authority, 3 validators:
-1. The proposer for block n is node `n mod 3`.
-2. It checks the transactions and mines the block.
-3. Every node independently re-checks the block, then signs its hash as a vote.
-4. With a majority (2 of 3) the block is committed.
-
-One node cannot add a block alone. One node may be offline; with two offline, nothing is added.
-
-**World state** (`state.js`). Who is authorised and each certificate's status are not stored separately: they are derived by replaying all transactions from block 0. The chain is the single source of truth.
-
-**Rules** (`state.js`). Duplicate ID or hash, unauthorised issuer, revoking twice, and revoking another university's certificate are all rejected.
-
-**Revocation.** A new `REVOKE` transaction. Nothing is deleted, so issue → revoke history stays visible.
-
-**Tamper recovery.** `audit()` re-validates each node's copy from block 0. A corrupted node is excluded and repaired from the healthy nodes (`repair()`, `npm run chain:repair`).
-
-**Verifying across many blocks.** A verification does not trust one row in one block. `crossCheck` (`backend/server/ledger.js`) asks all 3 nodes, only healthy nodes vote, and at least 2 must give the same answer. `walkFrom` then follows the links from the certificate's block to the latest block, re-checking each hash link and the validator signatures. The verifier's Proof section shows "nodes agree" and "links checked". Example: a certificate in block 17 of a 106-block chain checks 89 links.
-
-**Where is it stored?** Each node's blocks are rows in the `chain_blocks` table in PostgreSQL. The student's detailed academic record stays off-chain in normal tables.
-
-## 6. Measured results
+## 9. Measured results
 
 | Test | Result | Command |
 |---|---|---|
-| Automated tests | 117 passing; 124 with the database tests (`npm run test:db`) | `npm test` |
-| Safety checks removed one at a time (mutation check) | 42 / 42 caught by a test | see the audit report |
-| Labelled verification requests | 666/666 | `npm run chain:evaluate` |
-| Simulated marks-card photos (OCR + QR) | 120/126 overall | `npm run chain:photos` |
-| Forged or fake photos correctly rejected | 90/90 | same run |
-| Genuine or revoked photos correctly read | 30/36 (clean 11/12, phone-like 11/12, poor 8/12) | same run |
-
-Details: `backend/results/verification-evaluation.md`, `backend/results/photo-ocr.md`.
+| Automated tests (contract, API on Hardhat's Ethereum, photo, IPFS, security) | 92 passing; 99 with the database tests | `npm test`, `npm run test:db` |
+| Labelled verification requests | 666 / 666 | `npm run chain:evaluate` |
+| Simulated marks-card photos (OCR + QR), 42 per level | clean 42/42, phone-like 42/42, poor 39/42 | `npm run chain:photos` |
 
 Say this about the numbers if asked:
-- The 666 cases use the claimed details as clean text, so they test the verifier and chain, **not** OCR.
-- The 126 photos are rendered and degraded by software, **not taken by a camera**, and the matching rules were tuned on this kind of image. Real-world accuracy has not been measured and will be lower.
-- All 6 errors are a real certificate rejected because a semester row could not be read. We chose that side on purpose: a clear re-take fixes a false rejection, but a forgery accepted as valid would defeat the system. 90 forgeries in a sample does not prove none can ever pass.
-- Only this system's own card layout can be read. A certificate printed by a real university will not parse.
+- The 666 cases use the claimed details as clean text, so they test the verifier and contract, **not** OCR.
+- The photos are rendered and degraded by software, **not taken by a camera**. Real-world accuracy has not been measured.
+- The 3 errors are on small, blurred photos. We chose to reject when unsure: a clear re-take fixes a false rejection,
+  but a forgery accepted as valid would defeat the system.
 
-## 7. Known limits: say these before they are asked
+## 10. Known limits: say these before they are asked
 
-1. **Not truly decentralised.** The 3 nodes run in one server process with keys derived from one secret and copies in one database. It demonstrates the protocol. Whoever controls that server could rewrite all three copies; real deployment needs nodes run by different universities on separate machines.
-2. **With 3 validators, consensus tolerates a crash, not a malicious node majority.** Tolerating one actively malicious node in classical BFT needs at least 4 nodes.
-3. **Blocks are created on request.** There is no shared mempool or peer-to-peer gossip.
-4. **OCR tolerance.** Names allow small differences for OCR errors (90% similarity), and register numbers allow one character. So a one-letter name change on a long name may pass. Numbers (CGPA, year, date of birth) must match exactly.
-5. **Proves the document, not the person.** An exact copy of someone's genuine certificate returns VALID.
-6. **Revocation reasons are off-chain.** Only a hash of the reason is on-chain, so the readable text comes from the database.
-7. **Hybrid, not a full DApp.** Users go through our Express server, and users do not hold wallets. The only parts that do not depend on our server are the public anchor and its check in the browser.
+1. **Sepolia is a test network.** Same software and consensus as Ethereum mainnet; test ETH has no value.
+2. **The server and database are still central** for personal data, photo checks and sign-in. The contract,
+   IPFS and the QR check do not depend on them.
+3. **Proves the document, not the person.** An exact copy of someone's genuine certificate returns VALID.
+4. **Revocation reasons are off-chain.** Only `keccak256(reason)` is on-chain; the text is in the database.
+5. **The student app is a PWA** (installable web app), not Flutter. Hyperledger is not used; the brief lists it as an option.
+6. **OCR tolerance.** Names allow small OCR differences (90% similarity); numbers (CGPA, year, date of birth) must match exactly.
 
-## 8. Decentralisation and smart contracts
+## 11. Likely questions
 
-| Layer | What runs it | Trust |
-|---|---|---|
-| Own chain (records every certificate) | Our 3 validator nodes | Demonstrates the protocol; one operator today |
-| `CredentialRegistry.sol` on Sepolia (`anchorBatch`) | Public Ethereum test network | Independent of our server |
-| Rules for issuing and revoking | `backend/blockchain/state.js` on our chain | Same rules every node replays |
+**Why Ethereum and not your own chain?** A public chain is run by thousands of nodes we do not control, so
+nobody, including us, can rewrite a record. Our earlier own chain is kept in `archive/own-blockchain/`.
 
-**Is there a smart contract?** Yes, one: `backend/contracts/CredentialRegistry.sol`, deployed on Sepolia at `0xA34BE0F943de87b2414da6Ea44A49c2bb8d5B37a`. Each new head of our chain is sent to it (`backend/server/anchor.js`, `npm run chain:checkpoint`). Certificate rules on our own chain are ordinary JavaScript run by every node, which do the job a contract would.
+**What if someone edits the database?** The record no longer hashes to the docHash in the contract → INVALID.
 
-**What does the anchor prove?** If someone rewrites all three copies of our chain, the head no longer matches what is on Sepolia. The browser reads Sepolia directly (`src/lib/publicAnchor.js`), so this check does not rely on our server. It detects a rewrite made after an anchor; it cannot stop one, and anything since the last anchor is uncovered.
+**What if the server is hacked?** It holds no keys, so it cannot issue or revoke. The QR check still works without it.
 
-## 9. Likely questions
+**Why SHA-256 for the document and keccak256 in the contract?** SHA-256 is standard for documents and runs in every browser;
+keccak256 is Ethereum's native hash, cheap inside the contract.
 
-**Why build your own chain instead of Ethereum?** To implement and show the fundamentals, with no gas fees and full control of block contents. The trade-off is limit 1 above: a public chain is far harder to rewrite.
+**Why are signatures needed if we have hashes?** Hashes detect change; signatures prove who made the statement.
+MetaMask signs every transaction with the university's private key; the contract sees that address as `msg.sender`.
 
-**What if someone edits the database?** The record no longer hashes to the on-chain value → INVALID. Editing a stored block → that node fails validation.
+**Who pays gas?** The university's wallet, in Sepolia test ETH. One batch of ~150 certificates costs one transaction.
 
-**Why SHA-256?** Any change gives a completely different hash, and it is infeasible to find two inputs with the same hash.
-
-**Why are signatures needed if we have hashes?** Hashes detect change; signatures prove who made the statement. Anyone can compute a hash, only the key holder can sign.
-
-**What does the nonce do?** It is the only header field free to change, so miners vary it until the hash meets the difficulty.
-
-**Could a student fake a QR code?** The QR holds a hash that must equal the on-chain one, and the printed details are still compared.
+**Could a student fake a QR code?** The QR's hash must equal the one in the contract, and the printed details are still compared.
 
 **Where does OCR run?** In the browser (Tesseract). The photo is never uploaded; only the text read from it is sent.

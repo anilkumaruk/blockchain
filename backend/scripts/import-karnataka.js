@@ -185,7 +185,6 @@ const groupByEnrollment = (rows) => {
 };
 const credIdOf = (no) => no.replace(/\//g, '-');
 const semestersByEnrollment = groupByEnrollment(load('semester_results'));
-const univName = new Map(load('universities').map((u) => [u.univ_id, u.univ_name]));
 const byCertNo = new Map(certs.map((d) => [certNo(d), d]));
 const credentialOf = new Map(); // certificate_id -> credential record
 const batchEvent = (receipt) =>
@@ -209,7 +208,11 @@ for (const [univId, inst] of univById) {
   const ids = mine.map((d) => credIdOf(certNo(d)));
   const tree = buildMerkleTree(mine.map((_, i) => leafOf(ids[i], hashes[i])));
   const asUniversity = new Contract(deployment.address, deployment.abi, signerByUniv.get(univId));
-  const receipt = await mined(asUniversity.anchorBatch(tree.root, mine.length));
+  // A run interrupted after the batch was mined but before it was saved reuses
+  // that batch instead of anchoring the same root again.
+  const earlier = (await asOwner.queryFilter(asOwner.filters.BatchAnchored(null, null, null, inst.walletAddress), deployment.blockNumber))
+    .find((e) => e.args.root === tree.root && Number(e.args.count) === mine.length);
+  const receipt = earlier ? await provider.getTransactionReceipt(earlier.transactionHash) : await mined(asUniversity.anchorBatch(tree.root, mine.length));
   const batchId = Number(batchEvent(receipt).args.batchId);
 
   const records = mine.map((d, i) => ({
