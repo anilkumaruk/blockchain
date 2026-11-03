@@ -10,6 +10,30 @@ import { createAuth } from '../server/auth.js';
 import { createApp } from '../server/app.js';
 import { hashPassword } from '../server/passwords.js';
 
+// supertest starts each app with listen(0) on every interface, then connects to
+// 127.0.0.1. If another program already listens on 127.0.0.1 at the port the OS
+// picked, the request reaches that program and the test fails at random. So the
+// server is bound to 127.0.0.1 itself, just before the request is sent.
+const { Test } = request;
+const serverAddress = Test.prototype.serverAddress;
+Test.prototype.serverAddress = function (app, path) {
+  if (app.address()) return serverAddress.call(this, app, path);
+  this.unboundPath = path;
+  return `http://127.0.0.1${path}`; // replaced once the server is listening
+};
+const end = Test.prototype.end;
+Test.prototype.end = function (fn) {
+  if (this.unboundPath === undefined) return end.call(this, fn);
+  const path = this.unboundPath;
+  this.unboundPath = undefined;
+  this.app.listen(0, '127.0.0.1', () => {
+    this._server = this.app;
+    this.url = `http://127.0.0.1:${this.app.address().port}${path}`;
+    end.call(this, fn);
+  });
+  return this;
+};
+
 const ADMIN_HASH = await hashPassword('admin12345');
 const STUDENT_HASH = await hashPassword('student12345');
 const PLATFORM_HASH = await hashPassword('platform12345');
