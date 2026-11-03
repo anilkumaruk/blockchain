@@ -105,7 +105,8 @@ One node cannot add a block alone. One node may be offline; with two offline, no
 
 | Test | Result | Command |
 |---|---|---|
-| Automated tests | 94 passing, 6 skipped without a database | `npm test` |
+| Automated tests | 117 passing; 124 with the database tests (`npm run test:db`) | `npm test` |
+| Safety checks removed one at a time (mutation check) | 42 / 42 caught by a test | see the audit report |
 | Labelled verification requests | 666/666 | `npm run chain:evaluate` |
 | Simulated marks-card photos (OCR + QR) | 120/126 overall | `npm run chain:photos` |
 | Forged or fake photos correctly rejected | 90/90 | same run |

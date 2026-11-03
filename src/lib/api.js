@@ -1,5 +1,5 @@
 // Picks the data source for the whole app:
-//   - VITE_API_URL set   -> real backend (Express + Solidity registry via ethers.js)
+//   - VITE_API_URL set   -> real backend (Express + the project's own blockchain)
 //   - VITE_API_URL unset -> in-browser mock (the static Vercel demo)
 
 import * as mock from './mockApi';
