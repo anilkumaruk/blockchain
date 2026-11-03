@@ -75,12 +75,12 @@ export function createMemoryStore() {
   return {
     kind: 'memory',
     async insert(record) {
-      if (rows.has(record.credentialId)) throw new Error('duplicate credential_id');
+      if (rows.has(record.credentialId)) throw Object.assign(new Error('duplicate credential_id'), { code: '23505' });
       rows.set(record.credentialId, copy(record));
       return copy(record);
     },
     async insertMany(records) {
-      for (const r of records) if (rows.has(r.credentialId)) throw new Error('duplicate credential_id');
+      for (const r of records) if (rows.has(r.credentialId)) throw Object.assign(new Error('duplicate credential_id'), { code: '23505' });
       for (const r of records) rows.set(r.credentialId, copy(r));
       return records.map(copy);
     },

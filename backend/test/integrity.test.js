@@ -115,6 +115,16 @@ describe('Integrity', () => {
       expect((await request(app).get('/api/verify/COR-2026-BAT003')).body.status).to.equal('valid');
     });
 
+    it('records a double-submitted issue once', async () => {
+      const body = { ...CRED, studentId: 'D1', credentialId: 'COR-2026-DBL001' };
+      const [a, b] = await Promise.all([1, 2].map(() => request(app).post('/api/credentials').set(auth()).send(body)));
+      const codes = [a.status, b.status].sort();
+      expect(codes[0], JSON.stringify([a.body, b.body])).to.equal(201);
+      expect([201, 409]).to.include(codes[1]);
+      const issues = (await ledger.bridge(AUTHORITY).history('COR-2026-DBL001')).filter((e) => e.type === 'issued');
+      expect(issues).to.have.length(1);
+    });
+
     it('still rejects an ID that is on the chain for a different certificate', async () => {
       await ledger.bridge(AUTHORITY).issue('COR-2026-INT002', `0x${'ab'.repeat(32)}`);
       const res = await request(app).post('/api/credentials').set(auth()).send({ ...CRED, credentialId: 'COR-2026-INT002' });

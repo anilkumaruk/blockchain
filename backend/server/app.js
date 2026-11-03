@@ -977,6 +977,10 @@ export function createApp({
     if (err instanceof HttpError) {
       return res.status(err.status).json({ error: err.message, ...err.extra });
     }
+    // A unique-key clash in the database: a double submission lost the race.
+    if (err?.code === '23505') {
+      return res.status(409).json({ error: 'This record already exists.' });
+    }
     if (err?.type === 'entity.too.large') {
       return res.status(413).json({ status: 'rejected', code: 'invalid_file', error: 'Request body too large.' });
     }
