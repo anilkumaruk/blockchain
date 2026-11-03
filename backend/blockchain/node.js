@@ -3,7 +3,7 @@
 // re-checked everything itself.
 
 import { checkBlockContents } from './block.js';
-import { ZERO_HASH, addressOf, recoverSigner, signDigest } from './primitives.js';
+import { ZERO_HASH, addressOf, canonicalJson, recoverSigner, sha256, signDigest } from './primitives.js';
 import { ChainRuleError, LedgerState } from './state.js';
 import { checkTransaction, transactionId } from './transaction.js';
 
@@ -32,9 +32,11 @@ function checkLink(block, previous, expectedIndex) {
 /**
  * Replays a chain from block 0 with fresh state.
  * deep=true also verifies every ECDSA signature and validator vote (slower).
+ * `verified` (optional Set) remembers blocks whose signatures already passed, by
+ * a hash of the whole block, so identical copies are not checked twice.
  * Returns the state rebuilt from the valid prefix and the first problem found.
  */
-export function replayChain(blocks, { deep = true } = {}) {
+export function replayChain(blocks, { deep = true, verified } = {}) {
   const state = new LedgerState();
   for (let i = 0; i < blocks.length; i++) {
     const block = blocks[i];
@@ -43,7 +45,9 @@ export function replayChain(blocks, { deep = true } = {}) {
     if (problem) return fail(problem);
     // Always: stored data must still produce its id (the id feeds the Merkle root).
     if (block.transactions.some((tx) => transactionId(tx) !== tx.id)) return fail('transaction_data_altered');
-    if (deep) {
+    const fingerprint = deep && verified ? sha256(canonicalJson(block)) : null;
+    const checkSignatures = deep && !verified?.has(fingerprint);
+    if (checkSignatures) {
       for (const tx of block.transactions) {
         const txProblem = checkTransaction(tx);
         if (txProblem) return fail(`transaction_invalid: ${txProblem}`);
@@ -55,9 +59,10 @@ export function replayChain(blocks, { deep = true } = {}) {
       if (err instanceof ChainRuleError) return fail(`rule_violated: ${err.reason}`);
       throw err;
     }
-    if (deep) {
+    if (checkSignatures) {
       const votes = checkVotes(block, state.config.validators);
       if (votes) return fail(votes);
+      verified?.add(fingerprint);
     }
   }
   return { valid: true, validHeight: blocks.length - 1, invalidAt: null, problem: null, state };

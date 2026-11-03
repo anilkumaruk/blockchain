@@ -124,10 +124,14 @@ const toRuleError = (err) => {
 export function createLedger({ ledgerStore, authorityKey, validatorKeys, chainName, rootIssuerName, difficulty = 3, onCommit }) {
   const network = new BlockchainNetwork(validatorKeys);
   let loaded = null;
+  // Stored blocks are never trusted: every signature is checked when a block is
+  // first loaded. Blocks already checked are remembered, so refreshes stay fast.
+  const verified = new Set();
+  const loadOptions = { deep: true, verified };
 
   async function initialise() {
     for (const node of network.nodes) {
-      node.load(await ledgerStore.load(node.id), { deep: false });
+      node.load(await ledgerStore.load(node.id), loadOptions);
     }
     if (network.nodes.every((n) => n.blocks.length === 0)) {
       await write([
@@ -149,22 +153,34 @@ export function createLedger({ ledgerStore, authorityKey, validatorKeys, chainNa
     const heights = await store.heights();
     for (const node of network.nodes) {
       const stored = heights[node.id] ?? 0;
-      if (stored > node.blocks.length) node.load([...node.blocks, ...(await ledgerStore.load(node.id, node.blocks.length))], { deep: false });
+      if (stored > node.blocks.length) node.load([...node.blocks, ...(await ledgerStore.load(node.id, node.blocks.length))], loadOptions);
     }
   }
 
+  // Writers in this process run one at a time, so a second block is never
+  // proposed before the first is committed in memory too.
+  let writing = Promise.resolve();
+  const oneAtATime = (fn) => {
+    const run = writing.then(fn, fn);
+    writing = run.catch(() => {});
+    return run;
+  };
+
   /** One block: consensus, then durable storage, then in-memory commit. */
   async function write(transactions) {
-    const proposal = await ledgerStore.withLock(async (txStore) => {
-      await refresh();
-      const agreed = network.propose(transactions);
-      await txStore.append(agreed.block, agreed.voters.map((n) => n.id));
-      return agreed;
+    const block = await oneAtATime(async () => {
+      const proposal = await ledgerStore.withLock(async (txStore) => {
+        await refresh();
+        const agreed = network.propose(transactions);
+        await txStore.append(agreed.block, agreed.voters.map((n) => n.id));
+        return agreed;
+      });
+      // Only after the database committed, so memory can never get ahead of it.
+      network.commit(proposal);
+      return proposal.block;
     });
-    // Only after the database committed, so memory can never get ahead of it.
-    network.commit(proposal);
-    await onCommit?.(proposal.block);
-    return proposal.block;
+    await onCommit?.(block);
+    return block;
   }
 
   const guarded = async (fn) => {
