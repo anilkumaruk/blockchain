@@ -67,6 +67,16 @@ describe('Integrity', () => {
     expect(error?.name).to.equal('ChainUnavailableError');
   });
 
+  it('limits the expensive public chain checks to 6 a minute per client', async () => {
+    const ledger = createLedger(options(createMemoryLedgerStore(), 'rl'));
+    const store = createMemoryStore();
+    const app = createApp({ chain: ledger.bridge(AUTHORITY), connect: (k) => ledger.bridge(k), ledger, walletKey: TEST_WALLET_KEY, store, auth: createAuth({ jwtSecret: 'test-secret', store }), institutionName: 'U' });
+    const codes = [];
+    for (let i = 0; i < 7; i++) codes.push((await request(app).get('/api/chain/audit')).status);
+    expect(codes.slice(0, 6).every((c) => c === 200), codes.join()).to.equal(true);
+    expect(codes[6]).to.equal(429);
+  });
+
   describe('database failure after the chain write', () => {
     let app, store, token, ledger;
     const CRED = { studentName: 'Asha Rao', studentId: 'AU1', credentialType: 'B.Tech', issueDate: '2026-06-15', credentialId: 'COR-2026-INT001' };

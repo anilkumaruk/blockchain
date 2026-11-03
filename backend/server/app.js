@@ -97,6 +97,8 @@ export function createApp({
   const loginLimit = limiter(rateLimits, 15 * 60 * 1000, 20);
   const verifyLimit = limiter(rateLimits, 60 * 1000, 120);
   const writeLimit = limiter(rateLimits, 60 * 1000, 60);
+  // Public endpoints that re-check or re-mine the whole chain cost seconds of CPU each.
+  const heavyLimit = limiter(rateLimits, 60 * 1000, 6);
 
   const audit = (req, action, target = null, details = null) =>
     store.addAudit({ actor: req.user?.sub ?? null, action, target, ip: req.ip, details });
@@ -625,11 +627,11 @@ export function createApp({
       })
     );
     // Re-validates every node's copy from block 0, including all signatures.
-    app.get('/api/chain/audit', writeLimit, asyncRoute(async (_req, res) => res.json(await ledger.explorer.audit({ deep: true }))));
+    app.get('/api/chain/audit', heavyLimit, asyncRoute(async (_req, res) => res.json(await ledger.explorer.audit({ deep: true }))));
     // Attacks a throwaway copy of the chain; nothing is saved.
     app.post(
       '/api/chain/simulate-tamper',
-      writeLimit,
+      heavyLimit,
       express.json({ limit: '1kb' }),
       asyncRoute(async (req, res) => {
         const result = await ledger.explorer.simulateTamper(Number(req.body?.block) || 0);
