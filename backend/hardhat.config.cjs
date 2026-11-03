@@ -1,5 +1,6 @@
 require('@nomicfoundation/hardhat-ethers');
 require('@nomicfoundation/hardhat-chai-matchers');
+require('solidity-coverage');
 require('dotenv').config();
 
 const { SEPOLIA_RPC_URL, DEPLOYER_PRIVATE_KEY } = process.env;
