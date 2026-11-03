@@ -67,6 +67,8 @@ export function createMemoryStore() {
   const users = new Map();
   const institutions = new Map();
   const students = new Map();
+  const degreeRecords = [];
+  const marksByEnrollment = new Map();
   const audit = [];
   const copy = (r) => (r ? structuredClone(r) : null);
 
@@ -108,6 +110,35 @@ export function createMemoryStore() {
     },
     async listByInstitution(institutionId) {
       return [...rows.values()].filter((r) => r.institutionId === institutionId).reverse().map(copy);
+    },
+    addMarks(enrollmentId, marks) {
+      marksByEnrollment.set(enrollmentId, copy(marks));
+    },
+    async getMarks(enrollmentId) {
+      return copy(marksByEnrollment.get(enrollmentId) ?? null);
+    },
+    addDegreeRecord(record) {
+      degreeRecords.push(copy(record));
+    },
+    // By printed serial no., provisional no., or the number inside the canonical string.
+    async findDegreeRecord(no) {
+      const n = String(no).toLowerCase();
+      return copy(
+        degreeRecords.find(
+          (d) =>
+            d.certificate_serial_no?.toLowerCase() === n ||
+            d.provisional_cert_no?.toLowerCase() === n ||
+            d.canonical_string?.toLowerCase().startsWith(`${n}|`)
+        )
+      );
+    },
+    async listDegreeRecordsForStudent(studentId) {
+      return degreeRecords.filter((d) => d.student_id === studentId).map(copy);
+    },
+    async findCertificateNoInsensitive(no) {
+      const n = String(no).toLowerCase();
+      for (const r of rows.values()) if (r.certificateNo?.toLowerCase() === n || r.credentialId.toLowerCase() === n) return copy(r);
+      return null;
     },
     async countCredentialsByInstitution() {
       const out = {};
@@ -355,6 +386,36 @@ export async function createPgStore(connectionString, { ssl } = {}) {
     listAll: () => many('SELECT * FROM credentials ORDER BY created_at DESC'),
     listByInstitution: (iid) =>
       many('SELECT * FROM credentials WHERE institution_id = $1 ORDER BY created_at DESC', [iid]),
+    async getMarks(enrollmentId) {
+      const { rows: semesters } = await query(
+        'SELECT semester, credits_earned, sgpa, result, backlogs FROM semester_results WHERE enrollment_id = $1 ORDER BY semester',
+        [enrollmentId]
+      );
+      const { rows } = await query('SELECT academic_session, medium FROM enrollments WHERE enrollment_id = $1', [enrollmentId]);
+      return { semesters, batch: rows[0]?.academic_session ?? null, medium: rows[0]?.medium ?? null };
+    },
+    async findDegreeRecord(no) {
+      const n = String(no).toLowerCase();
+      const { rows } = await query(
+        `SELECT d.*, i.name AS university, i.source_ref AS univ_ref FROM degree_certificates d
+           JOIN institutions i ON i.id = d.institution_id
+          WHERE lower(d.certificate_serial_no) = $1 OR lower(d.provisional_cert_no) = $1
+             OR lower(split_part(d.canonical_string, '|', 1)) = $1
+          LIMIT 1`,
+        [n]
+      );
+      return rows[0] ?? null;
+    },
+    async listDegreeRecordsForStudent(studentId) {
+      const { rows } = await query(
+        `SELECT d.*, i.name AS university, i.source_ref AS univ_ref FROM degree_certificates d
+           JOIN institutions i ON i.id = d.institution_id WHERE d.student_id = $1`,
+        [studentId]
+      );
+      return rows;
+    },
+    findCertificateNoInsensitive: (no) =>
+      one('SELECT * FROM credentials WHERE lower(certificate_no) = lower($1) OR lower(credential_id) = lower($1) LIMIT 1', [no]),
     async countCredentialsByInstitution() {
       const { rows } = await query(
         'SELECT institution_id, count(*)::int AS n FROM credentials WHERE institution_id IS NOT NULL GROUP BY 1'

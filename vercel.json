@@ -2,7 +2,7 @@
   "functions": {
     "api/index.js": {
       "maxDuration": 60,
-      "includeFiles": "backend/server/migrations/**"
+      "includeFiles": "{backend/server/migrations/**,backend/deployments/sepolia.json}"
     }
   },
   "rewrites": [

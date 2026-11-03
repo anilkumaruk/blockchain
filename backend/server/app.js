@@ -2,6 +2,7 @@
 // frontend's src/lib/mockApi.js so the React app can switch between the mock
 // and this backend without changing any page code.
 
+import nodeCrypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -9,6 +10,8 @@ import { rateLimit } from 'express-rate-limit';
 import { buildCertificateBytes, computeSha256Hex } from '../../src/lib/generateCertificatePdf.js';
 import { ChainUnavailableError, ContractRevertError } from './chain.js';
 import { buildMerkleTree, leafOf } from './merkle.js';
+import { verifyCertificateEvidence } from './photoVerify.js';
+import { issuedCanonical, marksString, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
 import { createInstitutionService } from './institutions.js';
 import { hashPassword } from './passwords.js';
 
@@ -41,6 +44,7 @@ class HttpError extends Error {
   }
 }
 
+const sha256Hex = (text) => nodeCrypto.createHash('sha256').update(text).digest('hex');
 const randomHex = (bytes) => Buffer.from(crypto.getRandomValues(new Uint8Array(bytes))).toString('hex');
 const today = () => new Date().toISOString().slice(0, 10);
 const asyncRoute = (fn) => (req, res, next) => fn(req, res, next).catch(next);
@@ -64,6 +68,7 @@ function limiter(enabled, windowMs, limit) {
  *   institutionName: string,          // the platform owner (root institution)
  *   trustedIssuer?: string,
  *   connect: (privateKey: string) => ReturnType<import('./chain.js').createChainBridge>,
+ *   ledger?: ReturnType<import('./ledger.js').createLedger>,   // the project's own blockchain
  *   walletKey: Buffer,                // encrypts institution wallet keys
  *   fundingWei?: bigint,              // gas money sent to newly approved institutions
  *   corsOrigin?: string | string[] | boolean,
@@ -78,6 +83,7 @@ export function createApp({
   institutionName,
   trustedIssuer,
   connect,
+  ledger,
   walletKey,
   fundingWei = 10n ** 18n,
   corsOrigin = true,
@@ -120,6 +126,23 @@ export function createApp({
   // A university manages only its own credentials.
   const mayManage = (_req, record, actor) =>
     (record.institutionId ?? institutions.rootId) === actor.id;
+
+  // Everything printed on a downloaded marks card, confirmed against the chain.
+  async function printableCard(degree, credential) {
+    const view = degree ? viewFromDegree(degree) : viewFromCredential(credential);
+    const marks = degree ? await store.getMarks(degree.enrollment_id) : null;
+    if (marks) Object.assign(view, { semesters: marks.semesters, batch: marks.batch, medium: marks.medium });
+    const onChain = await chain.getById(view.credentialId);
+    const hash = sha256Hex(view.canonical);
+    return {
+      view,
+      hash,
+      txId: onChain?.txId ?? null,
+      block: onChain?.block ?? null,
+      status: onChain?.status ?? 'unknown',
+      marksVerified: Boolean(marks && onChain?.marksHash && sha256Hex(marksString(marks.semesters)) === onChain.marksHash),
+    };
+  }
 
   // ---- issuance helpers ----------------------------------------------------
 
@@ -188,7 +211,11 @@ export function createApp({
     // The backend, not the client, computes the fingerprint that goes on-chain.
     const hash = await computeSha256Hex(buildCertificateBytes(fields));
     const bridge = await institutions.bridgeFor(institution);
-    const receipt = await bridge.issue(fields.credentialId, hash);
+    // certHash is over the certificate's data, so a photo of it can be checked too.
+    const receipt = await bridge.issue(fields.credentialId, hash, {
+      certNo: fields.credentialId,
+      certHash: sha256Hex(issuedCanonical(fields)),
+    });
     const record = await store.insert({
       ...fields,
       ...extra,
@@ -470,6 +497,18 @@ export function createApp({
     })
   );
 
+  // Printable certificates, with the fingerprint for their QR code.
+  app.get(
+    '/api/me/certificates',
+    ...auth.requireRole('student'),
+    asyncRoute(async (req, res) => {
+      const degrees = await store.listDegreeRecordsForStudent(req.user.studentId);
+      const known = new Set(degrees.map((d) => d.credential_id));
+      const others = (await store.listByStudent(req.user.studentId)).filter((c) => !known.has(c.credentialId));
+      res.json(await Promise.all([...degrees.map((d) => printableCard(d, null)), ...others.map((c) => printableCard(null, c))]));
+    })
+  );
+
   app.get(
     '/api/me/credentials',
     ...auth.requireRole('student'),
@@ -511,6 +550,70 @@ export function createApp({
       res.json(await verifyByHash(req.body.hash));
     })
   );
+
+  // Certificate photo: the browser sends what it read from the picture (OCR
+  // text and any QR code); the answer is valid, invalid or revoked.
+  app.post(
+    '/api/verify/photo',
+    verifyLimit,
+    express.json({ limit: '64kb' }),
+    asyncRoute(async (req, res) => {
+      const ocrText = String(req.body?.ocrText ?? '').slice(0, 20000);
+      const qrText = String(req.body?.qrText ?? '').slice(0, 500);
+      if (!ocrText.trim() && !qrText.trim()) throw new HttpError(400, 'No text or QR code was read from the photo.');
+      if (!ledger) throw new HttpError(501, 'Photo verification needs the project blockchain.');
+      res.json(
+        await verifyCertificateEvidence(
+          { ocrText, qrText },
+          {
+            findDegree: (no) => store.findDegreeRecord(no),
+            findCredential: (no) => store.findCertificateNoInsensitive(no),
+            ledgerGet: (id) => chain.getById(id),
+            issuerTrusted: (address) => institutions.trustedByAddress(address),
+            proof: (txId) => ledger.explorer.inclusionProof(txId),
+            findMarks: async (enrollmentId) => (await store.getMarks(enrollmentId))?.semesters ?? null,
+            knownPrefixes: async () => (await store.listInstitutions()).map((i) => i.shortCode).filter(Boolean),
+          }
+        )
+      );
+    })
+  );
+
+  // ---- routes: the blockchain itself (public, read-only; no personal data) -----
+  if (ledger) {
+    app.get('/api/chain/summary', verifyLimit, asyncRoute(async (_req, res) => res.json(await ledger.explorer.summary())));
+    app.get(
+      '/api/chain/blocks',
+      verifyLimit,
+      asyncRoute(async (req, res) => {
+        const from = req.query.from == null ? undefined : Number(req.query.from);
+        const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+        res.json(await ledger.explorer.blocks({ from, limit }));
+      })
+    );
+    app.get(
+      '/api/chain/blocks/:index',
+      verifyLimit,
+      asyncRoute(async (req, res) => {
+        const block = await ledger.explorer.block(Number(req.params.index));
+        if (!block) throw new HttpError(404, 'No such block.');
+        res.json(block);
+      })
+    );
+    // Re-validates every node's copy from block 0, including all signatures.
+    app.get('/api/chain/audit', writeLimit, asyncRoute(async (_req, res) => res.json(await ledger.explorer.audit({ deep: true }))));
+    // Attacks a throwaway copy of the chain; nothing is saved.
+    app.post(
+      '/api/chain/simulate-tamper',
+      writeLimit,
+      express.json({ limit: '1kb' }),
+      asyncRoute(async (req, res) => {
+        const result = await ledger.explorer.simulateTamper(Number(req.body?.block) || 0);
+        if (!result) throw new HttpError(404, 'No certificate at or after that block.');
+        res.json(result);
+      })
+    );
+  }
 
   // Raw certificate upload. The server recomputes SHA-256 itself, so a
   // verifier does not have to trust a client-side hash.
@@ -590,8 +693,50 @@ export function createApp({
       }
 
       const hashes = await Promise.all(fieldsList.map((f) => computeSha256Hex(buildCertificateBytes(f))));
+      const issuerBridge = await institutions.bridgeFor(inst);
+      if (issuerBridge.issueMany) {
+        // Own chain: each certificate is a signed transaction; blocks hold up to 25.
+        const receipts = await issuerBridge.issueMany(
+          fieldsList.map((f, i) => ({
+            credentialId: f.credentialId,
+            certNo: f.credentialId,
+            hash: hashes[i],
+            certHash: sha256Hex(issuedCanonical(f)),
+          }))
+        );
+        const contract = await chain.address();
+        const records = await store.insertMany(
+          fieldsList.map((f, i) => ({
+            ...f,
+            institutionId: inst.id,
+            issuerAddress: inst.walletAddress,
+            hash: hashes[i],
+            status: 'valid',
+            revocation: null,
+            chain: {
+              mode: 'own-chain',
+              txHash: receipts[i].txHash,
+              blockNumber: receipts[i].blockNumber,
+              gasUsed: '0',
+              contract,
+            },
+          }))
+        );
+        for (const [i, f] of fieldsList.entries()) await recordStudent(f, emails[i], inst);
+        const lastBlock = receipts.at(-1).blockNumber;
+        await audit(req, 'batch_issued', `block:${lastBlock}`, { institution: inst.id, count: records.length });
+        return res.status(201).json({
+          batchId: lastBlock,
+          root: receipts.at(-1).blockHash,
+          txHash: receipts.at(-1).txHash,
+          gasUsed: '0',
+          count: records.length,
+          blocks: new Set(receipts.map((r) => r.blockNumber)).size,
+          credentials: records.map((r) => ({ credentialId: r.credentialId, hash: r.hash })),
+        });
+      }
       const tree = buildMerkleTree(fieldsList.map((f, i) => leafOf(f.credentialId, hashes[i])));
-      const receipt = await (await institutions.bridgeFor(inst)).anchorBatch(tree.root, fieldsList.length);
+      const receipt = await issuerBridge.anchorBatch(tree.root, fieldsList.length);
       const contract = await chain.address();
 
       const records = await store.insertMany(
@@ -686,6 +831,19 @@ export function createApp({
       await store.update(old.credentialId, { replacedBy: issued.credentialId });
       await audit(req, 'credential_reissued', old.credentialId, { replacedBy: issued.credentialId });
       res.status(201).json(issued);
+    })
+  );
+
+  app.get(
+    '/api/credentials/:id/certificate',
+    ...issuer,
+    asyncRoute(async (req, res) => {
+      const record = await store.get(req.params.id);
+      if (!record) throw new HttpError(404, 'Credential not found.');
+      const inst = await actingInstitution(req);
+      if (!mayManage(req, record, inst)) throw new HttpError(403, 'This credential belongs to another institution.');
+      const degree = await store.findDegreeRecord(record.certificateNo ?? record.credentialId);
+      res.json(await printableCard(degree, degree ? null : record));
     })
   );
 

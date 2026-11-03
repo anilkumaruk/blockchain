@@ -31,10 +31,12 @@ import {
   USE_BACKEND,
   getSession,
   getMyCredentials,
+  getMyCertificates,
   signOut,
 } from '../lib/api';
 import StudentAuth from '../components/StudentAuth';
 import { downloadCertificatePdf, downloadVerifiedResumePdf } from '../lib/generateCertificatePdf';
+import { downloadCertificateImage } from '../lib/certificateSvg';
 import {
   buildStudentProfile,
   groupCredentialsByYear,
@@ -337,6 +339,18 @@ function CredentialCard({ credential, notify }) {
     }
   };
 
+  // The printable certificate with QR code: a photo of this can be verified.
+  const handleDownloadImage = async () => {
+    try {
+      const all = await getMyCertificates();
+      const item = all.find((c) => c.view.credentialId === credential.credentialId);
+      if (!item) throw new Error('Certificate not found.');
+      await downloadCertificateImage(item);
+    } catch (err) {
+      notify(err.message || 'Could not create the certificate image.', 'error');
+    }
+  };
+
   const handleDownload = () => {
     downloadCertificatePdf(credential);
     notify('Certificate PDF downloaded.', 'info');
@@ -457,7 +471,7 @@ function CredentialCard({ credential, notify }) {
 
       <div className="mt-auto flex gap-2 pt-3">
         <button
-          onClick={handleDownload}
+          onClick={USE_BACKEND ? handleDownloadImage : handleDownload}
           className="flex-1 flex items-center justify-center gap-1.5 text-sm font-medium bg-teal text-white rounded-md px-3 py-2 hover:bg-teal/90"
         >
           <Download size={14} />

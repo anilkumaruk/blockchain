@@ -4,12 +4,8 @@
 
 import 'dotenv/config';
 import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { loadConfig } from './config.js';
 import { createRuntime } from './runtime.js';
-
-const here = path.dirname(fileURLToPath(import.meta.url));
 
 const { config, errors, warnings } = loadConfig();
 for (const w of warnings) console.warn(`[config] warning: ${w}`);
@@ -18,16 +14,14 @@ if (errors.length) {
   process.exit(1);
 }
 
-const file = path.join(here, '..', 'deployments', `${config.network}.json`);
-if (!fs.existsSync(file)) {
-  console.error(`No deployment found at ${file}. Run "npm run deploy:${config.network}" first.`);
-  process.exit(1);
+function loadDeployment() {
+  if (config.network !== 'sepolia') return undefined; // local runs do not touch the public network
+  return JSON.parse(fs.readFileSync(new URL('../deployments/sepolia.json', import.meta.url)));
 }
-const deployment = JSON.parse(fs.readFileSync(file, 'utf8'));
 
 let runtime;
 try {
-  runtime = await createRuntime(config, deployment);
+  runtime = await createRuntime(config, { deployment: loadDeployment() });
 } catch (err) {
   console.error(`[config] error: ${err.message}`);
   process.exit(1);
@@ -35,7 +29,6 @@ try {
 
 runtime.app.listen(config.port, () => {
   console.log(`Chain of Record API on http://localhost:${config.port}`);
-  console.log(`  registry: ${runtime.contract.target} (${config.network}, chainId ${deployment.chainId})`);
-  console.log(`  issuer:   ${runtime.signer.address}`);
+  console.log(`  blockchain: own chain, authority ${runtime.ledger.authority}`);
   console.log(`  store:    ${runtime.store.kind}`);
 });

@@ -121,6 +121,16 @@ export function logout() {
   }
 }
 
+export const verifyPhoto = (evidence) => http('/verify/photo', { method: 'POST', body: evidence });
+export const getChainSummary = () => http('/chain/summary');
+export const getChainBlocks = (from, limit = 12) =>
+  http(`/chain/blocks?limit=${limit}${from == null ? '' : `&from=${from}`}`);
+export const getChainBlock = (index) => http(`/chain/blocks/${index}`);
+export const auditChain = () => http('/chain/audit');
+export const simulateTamper = (block) => http('/chain/simulate-tamper', { method: 'POST', body: { block } });
+export const getMyCertificates = () => http('/me/certificates', { auth: true });
+export const getCertificateForIssuer = (id) => http(`/credentials/${encodeURIComponent(id)}/certificate`, { auth: true });
+
 export function registerStudent(email, password) {
   return http('/auth/register/student', { method: 'POST', body: { email, password } });
 }

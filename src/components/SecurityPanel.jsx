@@ -59,7 +59,7 @@ export default function SecurityPanel() {
       <div className="bg-card border border-border rounded-lg card-shadow p-5 sm:p-6 h-fit">
         <div className="flex items-center gap-2 mb-3">
           <ShieldCheck size={17} className="text-teal" />
-          <h2 className="text-base font-semibold">Registry contract</h2>
+          <h2 className="text-base font-semibold">Blockchain status</h2>
         </div>
         {loading && !registry ? (
           <Spinner size={18} />
@@ -67,7 +67,7 @@ export default function SecurityPanel() {
           <>
             <dl className="text-xs space-y-2 mb-4">
               <div>
-                <dt className="text-ink-soft">Contract</dt>
+                <dt className="text-ink-soft">Genesis block</dt>
                 <dd className="font-mono break-all">{registry.contract}</dd>
               </div>
               <div>

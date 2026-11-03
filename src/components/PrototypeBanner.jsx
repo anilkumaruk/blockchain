@@ -8,7 +8,7 @@ export default function PrototypeBanner() {
         <Info size={14} className="shrink-0" />
         <span>
           {USE_BACKEND
-            ? 'Connected to the Chain of Record server — credentials are anchored in a Solidity registry on an Ethereum-compatible network via ethers.js.'
+            ? 'Connected to the Chain of Record server. Certificates are recorded on the project blockchain; see every block on the Blockchain page.'
             : 'This is a frontend prototype for a B.Tech CSE academic project — all blockchain transactions and database calls are simulated in-browser, no real chain or server is involved.'}
         </span>
       </div>

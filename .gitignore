@@ -26,3 +26,6 @@ dist-ssr
 
 # Office lock files
 ~$*
+
+# Development-tool leftovers kept locally only
+archive/tool-files/

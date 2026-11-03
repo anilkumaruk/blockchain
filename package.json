@@ -19,10 +19,12 @@
     "lucide-react": "^1.39.0",
     "pg": "^8.13.1",
     "qr-scanner": "^1.4.2",
+    "qrcode": "^1.5.4",
     "qrcode.react": "^4.2.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
-    "react-router-dom": "^7.18.3"
+    "react-router-dom": "^7.18.3",
+    "tesseract.js": "^5.1.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

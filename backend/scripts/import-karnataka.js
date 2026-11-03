@@ -1,9 +1,10 @@
 // Imports the Karnataka Degree Registry (data/karnataka/*.json) into the
-// database and anchors every degree certificate on-chain:
-//   - each university becomes an approved institution with its own issuer wallet
-//   - each university's certificates are anchored in one Merkle-batch transaction
-//   - REVOKED / WITHHELD / CANCELLED_DUPLICATE_ISSUED certificates are then
-//     revoked on-chain with the dataset's reason
+// database and records every degree certificate on the project's own blockchain:
+//   - each university becomes an approved institution with its own signing key
+//   - each certificate is an ISSUE transaction signed by its university, in
+//     blocks of up to 25 transactions, carrying the dataset's canonical SHA-256
+//   - REVOKED / WITHHELD / CANCELLED_DUPLICATE_ISSUED certificates then get a
+//     REVOKE transaction with the dataset's reason
 //   - all academic tables (colleges, programs, students, enrollments,
 //     semester results, NAD export, verification requests) are loaded
 //   - 5 admin and 15 student test logins are created; their generated
@@ -23,15 +24,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { Contract, JsonRpcProvider, Wallet } from 'ethers';
 import { loadConfig } from '../server/config.js';
-import { createChainBridge } from '../server/chain.js';
+import { createLedgerFor } from '../server/runtime.js';
 import { createPgStore } from '../server/store.js';
 import { createInstitutionService } from '../server/institutions.js';
 import { hashPassword, verifyPassword } from '../server/passwords.js';
-import { buildMerkleTree, leafOf } from '../server/merkle.js';
 import { slugify } from '../server/wallets.js';
 import { buildCertificateBytes, computeSha256Hex } from '../../src/lib/generateCertificatePdf.js';
+import { marksString } from '../../src/lib/certificateView.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DATA = path.join(here, '..', 'data', 'karnataka');
@@ -44,24 +44,19 @@ if (errors.length || config.useMemoryStore) {
   process.exit(1);
 }
 
-const deployment = JSON.parse(fs.readFileSync(path.join(here, '..', 'deployments', `${config.network}.json`), 'utf8'));
-const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true, cacheTimeout: -1 });
-// The local chain mines instantly; don't wait ethers' default 4 s between receipt checks.
-if (config.network === 'localhost') provider.pollingInterval = 200;
-const contract = new Contract(config.contractAddress || deployment.address, deployment.abi, new Wallet(config.issuerKey, provider));
-const contractAddress = await contract.getAddress();
-const bridgeOptions = { fromBlock: deployment.blockNumber ?? 0 };
 const store = await createPgStore(config.databaseUrl, { ssl: config.databaseSsl });
+const ledger = createLedgerFor(config, store);
+const authorityBridge = ledger.bridge(config.issuerKey);
+const contractAddress = await authorityBridge.address();
 const institutions = createInstitutionService({
-  chain: createChainBridge(contract, bridgeOptions),
-  connect: (pk) => createChainBridge(contract.connect(new Wallet(pk, provider)), bridgeOptions),
+  chain: authorityBridge,
+  connect: (pk) => ledger.bridge(pk),
   store,
   walletKey: config.walletKey,
   fundingWei: config.fundingWei,
   rootName: config.institutionName,
   trustedIssuer: config.trustedIssuer,
 });
-
 
 const yn = (v) => (v === 'Y' ? true : v === 'N' ? false : null);
 const isoDate = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
@@ -176,10 +171,19 @@ await insertRows(
 
 // ---- degree certificates -> on-chain credentials (one Merkle batch per university)
 console.log('Degree certificates -> blockchain');
+const groupByEnrollment = (rows) => {
+  const map = new Map();
+  for (const r of rows) map.set(r.enrollment_id, [...(map.get(r.enrollment_id) ?? []), r]);
+  return map;
+};
 const credIdOf = (no) => no.replace(/\//g, '-');
+const semestersByEnrollment = groupByEnrollment(load('semester_results'));
+const marksHashOf = (enrollmentId) => {
+  const rows = semestersByEnrollment.get(enrollmentId);
+  return rows ? crypto.createHash('sha256').update(marksString(rows)).digest('hex') : null;
+};
 const byCertNo = new Map(certs.map((d) => [certNo(d), d]));
 const credentialOf = new Map(); // certificate_id -> credential record
-let gasTotal = 0n;
 
 for (const [univId, inst] of univById) {
   const mine = certs.filter((d) => d.univ_id === univId);
@@ -193,7 +197,6 @@ for (const [univId, inst] of univById) {
       credentialOf.set(d.certificate_id, {
         credentialId: r.credential_id,
         hash: r.doc_hash,
-        batch: r.batch,
         issueDate: r.issue_date,
         status: r.status,
       });
@@ -214,10 +217,22 @@ for (const [univId, inst] of univById) {
     txHash: '0x' + crypto.randomBytes(32).toString('hex'),
   }));
   const hashes = await Promise.all(fieldsList.map((f) => computeSha256Hex(buildCertificateBytes(f))));
-  const tree = buildMerkleTree(fieldsList.map((f, i) => leafOf(f.credentialId, hashes[i])));
   const bridge = await institutions.bridgeFor(inst);
-  const receipt = await bridge.anchorBatch(tree.root, fieldsList.length);
-  gasTotal += BigInt(receipt.gasUsed);
+  // Resumable: only submit what the chain does not hold yet.
+  const onChain = await Promise.all(fieldsList.map((f) => authorityBridge.getById(f.credentialId)));
+  const missing = fieldsList.map((f, i) => i).filter((i) => !onChain[i]);
+  const fresh = await bridge.issueMany(
+    missing.map((i) => ({
+      credentialId: fieldsList[i].credentialId,
+      certNo: certNo(mine[i]),
+      hash: hashes[i],
+      certHash: mine[i].sha256_hash, // SHA-256 of the registry's canonical string
+      marksHash: marksHashOf(mine[i].enrollment_id),
+    }))
+  );
+  const receiptOf = new Map(missing.map((i, n) => [i, fresh[n]]));
+  const receipt = (i) =>
+    receiptOf.get(i) ?? { txHash: `0x${onChain[i].txId}`, blockNumber: onChain[i].block, gasUsed: 0n };
 
   const records = fieldsList.map((f, i) => ({
     ...f,
@@ -227,12 +242,11 @@ for (const [univId, inst] of univById) {
     hash: hashes[i],
     status: 'valid',
     revocation: null,
-    batch: { batchId: receipt.batchId, root: tree.root, proof: tree.proof(i), index: i },
     chain: {
-      mode: 'batch',
-      txHash: receipt.txHash,
-      blockNumber: receipt.blockNumber,
-      gasUsed: String(receipt.gasUsed),
+      mode: 'own-chain',
+      txHash: receipt(i).txHash,
+      blockNumber: receipt(i).blockNumber,
+      gasUsed: '0',
       contract: contractAddress,
       source: SOURCE,
       sourceId: mine[i].certificate_id,
@@ -240,43 +254,46 @@ for (const [univId, inst] of univById) {
   }));
   await store.insertMany(records);
   records.forEach((r, i) => credentialOf.set(mine[i].certificate_id, r));
-  console.log(`  ${univById.get(univId).shortCode.padEnd(8)} batch #${receipt.batchId}: ${records.length} certificates, gas ${receipt.gasUsed}`);
+  const blockNumbers = records.map((r) => r.chain.blockNumber);
+  console.log(`  ${inst.shortCode.padEnd(8)} ${records.length} certificates in blocks ${Math.min(...blockNumbers)}-${Math.max(...blockNumbers)}`);
 }
 
 // Revoke what the registry says is not valid, with the registry's reason.
 let revoked = 0;
-for (const d of certs.filter((c) => ['REVOKED', 'WITHHELD', 'CANCELLED_DUPLICATE_ISSUED'].includes(c.certificate_status))) {
-  const rec = credentialOf.get(d.certificate_id);
-  if (rec.status === 'revoked') continue; // done in an earlier run
-  const inst = univById.get(d.univ_id);
-  const reason = d.certificate_status === 'WITHHELD' ? `Withheld: ${d.revocation_reason}` : d.revocation_reason;
-  let receipt;
-  try {
-    receipt = await (await institutions.bridgeFor(inst)).revokeBatch(
-      { ...rec.batch, credentialId: rec.credentialId, hash: rec.hash },
-      reason
-    );
-  } catch (err) {
-    // An interrupted run may have revoked it on-chain without recording it.
-    if (err.reason !== 'AlreadyRevoked') throw err;
-    receipt = { txHash: null, blockNumber: null, gasUsed: 0n };
+for (const [univId, inst] of univById) {
+  const list = certs
+    .filter((c) => c.univ_id === univId && ['REVOKED', 'WITHHELD', 'CANCELLED_DUPLICATE_ISSUED'].includes(c.certificate_status))
+    .filter((d) => credentialOf.get(d.certificate_id).status !== 'revoked')
+    .map((d) => ({
+      d,
+      rec: credentialOf.get(d.certificate_id),
+      reason: d.certificate_status === 'WITHHELD' ? `Withheld: ${d.revocation_reason}` : d.revocation_reason,
+    }));
+  const todo = [];
+  for (const item of list) {
+    if ((await authorityBridge.getById(item.rec.credentialId)).status !== 'revoked') todo.push(item);
   }
-  gasTotal += BigInt(receipt.gasUsed);
-  const patch = {
-    status: 'revoked',
-    revocation: { reason, date: rec.issueDate, txHash: receipt.txHash, blockNumber: receipt.blockNumber, gasUsed: String(receipt.gasUsed) },
-  };
-  const superseded = /^Superseded by (\S+)/.exec(d.revocation_reason || '');
-  if (superseded && byCertNo.has(superseded[1])) patch.replacedBy = credIdOf(superseded[1]);
-  await store.update(rec.credentialId, patch);
-  revoked++;
+  const bridge = await institutions.bridgeFor(inst);
+  const receipts = await bridge.revokeMany(todo.map((t) => ({ credentialId: t.rec.credentialId, reason: t.reason })));
+  const receiptFor = new Map(todo.map((t, i) => [t, receipts[i]]));
+  for (const item of list) {
+    const r = receiptFor.get(item) ?? { txHash: null, blockNumber: null };
+    const patch = {
+      status: 'revoked',
+      revocation: { reason: item.reason, date: item.rec.issueDate, txHash: r.txHash, blockNumber: r.blockNumber, gasUsed: '0' },
+    };
+    const superseded = /^Superseded by (\S+)/.exec(item.d.revocation_reason || '');
+    if (superseded && byCertNo.has(superseded[1])) patch.replacedBy = credIdOf(superseded[1]);
+    await store.update(item.rec.credentialId, patch);
+    revoked++;
+  }
 }
 // Duplicates issued for lost originals point back to the cancelled original.
 for (const d of certs) {
   const dup = /^Duplicate of (\S+)/.exec(d.revocation_reason || '');
   if (dup && byCertNo.has(dup[1])) await store.update(credentialOf.get(d.certificate_id).credentialId, { replaces: credIdOf(dup[1]) });
 }
-console.log(`  revoked on-chain: ${revoked}; total gas ${gasTotal}`);
+console.log(`  revoked on-chain: ${revoked}`);
 
 console.log('Registry tables');
 await insertRows(
@@ -328,7 +345,6 @@ await store.addAudit({
     students: students.length,
     certificates: certs.length,
     revokedOnChain: revoked,
-    gas: String(gasTotal),
     logins: loginCount,
   },
 });

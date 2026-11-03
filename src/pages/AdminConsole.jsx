@@ -47,12 +47,14 @@ import {
   fakeCredentialId,
   fakeTxHash,
   adminLogin,
+  getCertificateForIssuer,
   adminLogout,
   currentInstitution,
   getSession,
   USE_BACKEND,
 } from '../lib/api';
 import { buildCertificateBytes, computeSha256Hex, downloadCertificatePdf } from '../lib/generateCertificatePdf';
+import { downloadCertificateImage } from '../lib/certificateSvg';
 
 const CREDENTIAL_TYPES = [
   'B.Tech in Computer Science & Engineering',
@@ -79,6 +81,17 @@ export default function AdminConsole() {
     );
   }
   return <AdminDashboard />;
+}
+
+// The printable certificate with QR code (a photo of it can be verified);
+// the mock demo has no server to fetch it from, so it keeps the PDF.
+async function downloadPrintable(credential, notify) {
+  if (!USE_BACKEND) return downloadCertificatePdf(credential);
+  try {
+    await downloadCertificateImage(await getCertificateForIssuer(credential.credentialId));
+  } catch (err) {
+    notify?.(err.message || 'Could not create the certificate image.', 'error');
+  }
 }
 
 // ---- Login -----------------------------------------------------------------
@@ -857,8 +870,8 @@ function SuccessPanel({ result, onViewCredential, onIssueAnother }) {
   };
 
   const handleDownload = () => {
-    downloadCertificatePdf(result.record);
-    notify('Certificate PDF downloaded.', 'info');
+    downloadPrintable(result.record, notify);
+    notify('Certificate downloaded.', 'info');
   };
 
   return (
@@ -1090,8 +1103,8 @@ function CredentialDetailPanel({ credentialId, credentials, onClose, onRevoked }
   const revoked = credential.status === 'revoked';
 
   const handleDownload = () => {
-    downloadCertificatePdf(credential);
-    notify('Certificate PDF downloaded.', 'info');
+    downloadPrintable(credential, notify);
+    notify('Certificate downloaded.', 'info');
   };
 
   return (

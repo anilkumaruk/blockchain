@@ -1,10 +1,11 @@
 import { NavLink } from 'react-router-dom';
-import { Link2, ShieldCheck, GraduationCap, Building2 } from 'lucide-react';
+import { Blocks, Link2, ShieldCheck, GraduationCap, Building2 } from 'lucide-react';
 
 const ROLES = [
   { to: '/admin', label: 'Admin', icon: ShieldCheck },
   { to: '/student', label: 'Student', icon: GraduationCap },
   { to: '/verify', label: 'Employer / Verifier', icon: Building2 },
+  { to: '/chain', label: 'Blockchain', icon: Blocks },
 ];
 
 export default function TopNav() {

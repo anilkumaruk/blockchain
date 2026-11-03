@@ -2,26 +2,31 @@
 // Shared by the local server (server/index.js) and the Vercel serverless
 // function (api/index.js at the repo root).
 
-import { Contract, JsonRpcProvider, Wallet } from 'ethers';
-import { createChainBridge } from './chain.js';
+import { createPublicAnchor } from './anchor.js';
+import { createLedger, createMemoryLedgerStore, createPgLedgerStore, deriveValidatorKeys } from './ledger.js';
 import { createMemoryStore, createPgStore } from './store.js';
 import { createAuth } from './auth.js';
 import { hashPassword } from './passwords.js';
 import { createApp } from './app.js';
 
+/** The project's own blockchain, stored in the same database. */
+export function createLedgerFor(config, store, { onCommit } = {}) {
+  return createLedger({
+    onCommit,
+    ledgerStore: store.kind === 'postgres' ? createPgLedgerStore(store) : createMemoryLedgerStore(),
+    authorityKey: config.issuerKey,
+    validatorKeys: deriveValidatorKeys(config.walletKey),
+    chainName: 'Chain of Record',
+    rootIssuerName: config.institutionName,
+  });
+}
+
 /**
  * @param {ReturnType<import('./config.js').loadConfig>['config']} config
- * @param {{ address: string, abi: object[], chainId: number, blockNumber?: number }} deployment
- * @param {{ bootstrapAdmin?: boolean }} [options]
+ * @param {{ bootstrapAdmin?: boolean, deployment?: object }} [options]
+ *        deployment: the Sepolia contract; when set, new blocks are anchored there.
  */
-export async function createRuntime(config, deployment, { bootstrapAdmin = true } = {}) {
-  // cacheTimeout -1: never reuse a cached nonce for back-to-back transactions.
-  const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true, cacheTimeout: -1 });
-  // The local chain mines instantly; don't wait ethers' default 4 s between receipt checks.
-  if (config.network === 'localhost') provider.pollingInterval = 200;
-  const signer = new Wallet(config.issuerKey, provider);
-  const contract = new Contract(config.contractAddress || deployment.address, deployment.abi, signer);
-
+export async function createRuntime(config, { bootstrapAdmin = true, deployment } = {}) {
   const store = config.useMemoryStore
     ? createMemoryStore()
     : await createPgStore(config.databaseUrl, { ssl: config.databaseSsl });
@@ -35,11 +40,15 @@ export async function createRuntime(config, deployment, { bootstrapAdmin = true 
     console.log(`  created initial admin account "${username}"`);
   }
 
-  const bridgeOptions = { fromBlock: deployment.blockNumber ?? 0 };
+  const anchor = deployment
+    ? createPublicAnchor({ rpcUrl: config.rpcUrl, privateKey: config.issuerKey, deployment })
+    : null;
+  const ledger = createLedgerFor(config, store, { onCommit: anchor?.bestEffort });
   const app = createApp({
-    chain: createChainBridge(contract, bridgeOptions),
-    // Each approved institution signs with its own wallet on the same registry.
-    connect: (privateKey) => createChainBridge(contract.connect(new Wallet(privateKey, provider)), bridgeOptions),
+    chain: ledger.bridge(config.issuerKey),
+    // Each approved institution signs its transactions with its own key.
+    connect: (privateKey) => ledger.bridge(privateKey),
+    ledger,
     walletKey: config.walletKey,
     fundingWei: config.fundingWei,
     store,
@@ -50,5 +59,5 @@ export async function createRuntime(config, deployment, { bootstrapAdmin = true 
     trustProxy: config.trustProxy,
   });
 
-  return { app, store, contract, signer };
+  return { app, store, ledger };
 }

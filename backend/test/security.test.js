@@ -173,7 +173,9 @@ describe('Security', () => {
       // Only the platform admin can read the audit log; registrars can't.
       expect((await request(audited).get('/api/admin/audit').set('Authorization', `Bearer ${t}`)).status).to.equal(403);
       const p = await login(audited, 'platform.admin', 'platform12345');
-      const log = (await request(audited).get('/api/admin/audit').set('Authorization', `Bearer ${p}`)).body;
+      const auditRes = await request(audited).get('/api/admin/audit').set('Authorization', `Bearer ${p}`);
+      expect(auditRes.status, JSON.stringify(auditRes.body)).to.equal(200);
+      const log = auditRes.body;
       expect(log.map((e) => e.action)).to.deep.equal([
         'login',
         'credential_revoked',

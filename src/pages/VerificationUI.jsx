@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import {
+  Camera,
   QrCode,
   Hash,
   Upload,
@@ -27,10 +28,12 @@ import VerificationHistory, {
   clearVerificationHistory,
 } from '../components/VerificationHistory';
 import QrScanTab from '../components/QrScanTab';
-import { verifyCredential, getAllCredentials } from '../lib/api';
+import PhotoVerifyTab from '../components/PhotoVerifyTab';
+import { verifyCredential, getAllCredentials, USE_BACKEND } from '../lib/api';
 import { resolveVerificationState } from '../lib/verification';
 
 const TABS = [
+  ...(USE_BACKEND ? [{ key: 'photo', label: 'Certificate Photo', icon: Camera }] : []),
   { key: 'id', label: 'Credential ID', icon: Hash },
   { key: 'upload', label: 'Upload Certificate', icon: Upload },
   { key: 'qr', label: 'Scan QR Code', icon: QrCode },
@@ -40,7 +43,7 @@ const TABS = [
 export default function VerificationUI() {
   const { notify } = useToast();
   const [searchParams] = useSearchParams();
-  const [tab, setTab] = useState('id');
+  const [tab, setTab] = useState(USE_BACKEND ? 'photo' : 'id');
   const [idValue, setIdValue] = useState('');
   const [result, setResult] = useState(null);
   const [verifying, setVerifying] = useState(false);
@@ -157,6 +160,7 @@ export default function VerificationUI() {
         </div>
 
         <div className="p-6">
+          {tab === 'photo' && <PhotoVerifyTab />}
           {tab === 'id' && (
             <IdTab
               value={idValue}

@@ -6,6 +6,7 @@ import StudentPortal from './pages/StudentPortal';
 import VerificationUI from './pages/VerificationUI';
 import PublicProfile from './pages/PublicProfile';
 import InstitutionRegister from './pages/InstitutionRegister';
+import ChainExplorer from './pages/ChainExplorer';
 import { AuthProvider } from './context/AuthContext';
 import { ToastProvider } from './context/ToastContext';
 
@@ -23,6 +24,7 @@ export default function App() {
               <Route path="/verify" element={<VerificationUI />} />
               <Route path="/profile/:studentId" element={<PublicProfile />} />
               <Route path="/register/institution" element={<InstitutionRegister />} />
+              <Route path="/chain" element={<ChainExplorer />} />
               <Route path="*" element={<Navigate to="/verify" replace />} />
             </Routes>
           </main>

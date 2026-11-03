@@ -4,11 +4,25 @@ E1CSA313 Design Project-1, Alliance University
 Team: Manu M P, Tarun Kumar S, Anilkumar U K, Pruthviraj D N · Mentor: Dr. Saravanan P
 
 A blockchain-backed verification layer on top of a university's academic records.
-At issuance, the SHA-256 fingerprint of each certificate is anchored in a Solidity
-registry. Anyone can then verify a certificate by credential ID, QR code or PDF
-upload, without contacting the university.
+At issuance, the SHA-256 fingerprints of each certificate and its marks are recorded on
+the project's own blockchain, whose latest block is anchored to a Solidity contract on
+Sepolia. Anyone can then verify a marks card from a photo, QR code or credential ID.
 
-- Live frontend demo (in-browser mock mode): https://blockchain-ecru-three.vercel.app
+- Website: https://blockchain-ecru-three.vercel.app
+
+## What it does
+
+**Input: a photo of a certificate. Output: VALID, INVALID or REVOKED.**
+
+The blockchain is the project's own, written from scratch in `backend/blockchain/`: blocks with SHA-256 hash links, Merkle trees, ECDSA-signed transactions, proof of work and majority voting among 3 validator nodes. Each verification asks all 3 nodes, needs a majority, and walks the links from the certificate's block to the latest block.
+
+- Explain it: [docs/BLOCKCHAIN_VIVA_GUIDE.md](docs/BLOCKCHAIN_VIVA_GUIDE.md)
+- See it: the **Blockchain** page (`/chain`), or `cd backend && npm run chain:demo`
+- Measure it: `npm test`, `npm run chain:evaluate`, `npm run chain:photos`
+
+Rebuild the data: `npm run db:reset -- --confirm && npm run import:karnataka`, then send the latest block to Sepolia with `npm run chain:checkpoint`. No blockchain node needs running; the chain is stored in PostgreSQL.
+
+The sections below describe the rest of the system. Where they mention per-credential Solidity transactions, gas or Hardhat nodes, that is the earlier version. Today the contract is used only to anchor the chain head.
 
 ## Architecture
 
@@ -49,12 +63,11 @@ See [SECURITY.md](SECURITY.md) for the threat model and all security controls.
   email their institution has on record (entered as "Student personal email" when issuing), and see
   only their own credentials.
 
-## Dataset: Fluree Academic Credentials
+## Dataset: Karnataka Degree Registry
 
-`backend/data/fluree-acd` holds the MIT-licensed [Fluree ACD](https://github.com/fluree/dataset-academic-credentials).
-`npm run import:fluree` loads its 11 issuing institutions, 2 employers, 3 students and 51 credentials into
-the database and anchors every credential on-chain under its institution's wallet. It is safe to re-run.
-Imported students can register with their dataset emails (e.g. `freddyyeti1@fluree.edu`).
+`backend/data/karnataka` holds the dataset (16 universities, 2,000 students, 1,604 degree certificates,
+666 labelled verification requests). `npm run import:karnataka` loads it and records every certificate
+on the chain. Test logins are written to `backend/data/karnataka/TEST_LOGINS.md`, which is not committed.
 
 | Data | Where | Why |
 |---|---|---|
@@ -69,19 +82,27 @@ is detected too (`record_mismatch`).
 ## Repository layout
 
 ```
-src/                    React frontend (Admin Console, Student Portal, Verification UI)
-  lib/api.js            Switch: real backend if VITE_API_URL is set, else in-browser mock
-  lib/httpApi.js        Backend client
-  lib/mockApi.js        In-browser mock (used by the Vercel demo)
+src/                    Website (React): pages/, components/, lib/
+  pages/VerificationUI.jsx      Verify a certificate photo, QR or ID
+  pages/ChainExplorer.jsx       Blockchain page: blocks, nodes, tamper demo
+  lib/certificateSvg.js         Student marks card design
+  lib/photoEvidence.js          Reads the photo in the browser (QR + OCR)
+public/                 Sample certificate photos and the OCR engine files
+api/index.js            Vercel entry point for the backend
 backend/
-  contracts/CredentialRegistry.sol   Solidity registry (issue / revoke / verify)
-  server/               Express API: app.js, auth.js (JWT+RBAC), chain.js (ethers bridge),
-                        store.js (PostgreSQL), merkle.js, passwords.js (scrypt), config.js
-  server/migrations/    Versioned SQL schema (credentials, users, audit_log)
-  test/                 Contract, Merkle batch, security, PostgreSQL and Review-1 scenario tests
-  scripts/              deploy.js, seed.js, benchmark.js, create-user.js
-  results/benchmark.md  Latest performance evaluation
+  blockchain/           The project's own blockchain (blocks, Merkle, signatures, consensus)
+  server/               Express API: app.js, ledger.js, photoVerify.js, anchor.js, store.js, auth.js
+  server/migrations/    Database schema (SQL)
+  contracts/            Solidity contract on Sepolia (anchors the chain head)
+  data/karnataka/       The dataset
+  scripts/              Import, reset, chain demo/repair/checkpoint, evaluation
+  test/                 Automated tests
+  results/              Measured results (verification, photo OCR)
+docs/BLOCKCHAIN_VIVA_GUIDE.md   How the blockchain works, for the viva
+archive/                Old and unused files, kept for reference only
 ```
+
+Folders created by tools, not edited by hand: `node_modules/`, `dist/`, `backend/artifacts/`, `backend/cache/`.
 
 ## Running the full stack locally
 
@@ -98,7 +119,7 @@ npm run chain
 # 3. Deploy the registry, start the API, seed demo data (terminal 2)
 npm run deploy:local
 npm start                 # runs DB migrations, creates the first admin, http://localhost:4000
-npm run seed              # issues the 8 demo credentials (2 revoked) on-chain
+npm run import:karnataka  # loads the dataset onto the chain
 
 # 4. Frontend against the real backend (terminal 3, repo root)
 VITE_API_URL=http://localhost:4000 npm run dev
@@ -172,7 +193,8 @@ precise `code` (`not_found`, `hash_mismatch`, `untrusted_issuer`, `record_mismat
 cd backend
 npm test            # 53 tests: contract, Merkle batch, security, 10 Review-1 scenarios
 npm run test:db     # + 6 PostgreSQL integration tests (needs npm run db:up)
-npm run benchmark   # writes results/benchmark.md (gas, batch savings, latency, accuracy)
+npm run chain:evaluate  # 666 labelled verification requests
+npm run chain:photos    # simulated certificate photos (OCR + QR)
 ```
 
 | # | Scenario | Expected | Automated test |

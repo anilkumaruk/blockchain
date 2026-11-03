@@ -21,7 +21,7 @@ if (errors.length || !config.databaseUrl) {
 }
 const store = await createPgStore(config.databaseUrl, { ssl: config.databaseSsl });
 const tables = [
-  'verification_requests', 'nad_awards', 'degree_certificates', 'semester_results', 'enrollments',
+  'chain_blocks', 'verification_requests', 'nad_awards', 'degree_certificates', 'semester_results', 'enrollments',
   'programs', 'colleges', 'credentials', 'users', 'students', 'institutions', 'audit_log',
 ];
 const { rows } = await store.raw(

@@ -13,4 +13,5 @@ backend/deployments/localhost.json
 backend/.agents
 backend/.claude
 docs
+archive
 *.log

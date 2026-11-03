@@ -26,6 +26,9 @@ export function parseChainOfRecordQr(text) {
     if (profileMatch) {
       return { type: 'profile', studentId: decodeURIComponent(profileMatch[1]) };
     }
+    // The QR on a marks card: /verify?credentialId=...&h=...
+    const credentialId = url.pathname === '/verify' ? url.searchParams.get('credentialId') : null;
+    if (credentialId) return { type: 'credential', credentialId };
   } catch {
     // Not URL-shaped at all — fall through to the raw credential ID check.
   }

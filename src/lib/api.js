@@ -57,4 +57,12 @@ export const {
   getMyCredentials,
   listInstitutionsAdmin,
   setInstitutionStatus,
+  verifyPhoto,
+  getChainSummary,
+  getChainBlocks,
+  getChainBlock,
+  auditChain,
+  simulateTamper,
+  getMyCertificates,
+  getCertificateForIssuer,
 } = backend;

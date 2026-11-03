@@ -9,17 +9,19 @@
     "chain": "hardhat node",
     "deploy:local": "hardhat run scripts/deploy.js --network localhost",
     "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia",
-    "benchmark": "hardhat run scripts/benchmark.js",
     "start": "node server/index.js",
-    "seed": "node scripts/seed.js",
     "db:up": "docker compose up -d",
     "db:down": "docker compose down",
     "test:db": "TEST_DATABASE_URL=${TEST_DATABASE_URL:-postgres://chain:chain@localhost:5544/chain_of_record} hardhat test",
     "create-user": "node scripts/create-user.js",
     "db:check": "node scripts/db-check.js",
-    "import:fluree": "node scripts/import-fluree.js",
     "import:karnataka": "node scripts/import-karnataka.js",
-    "db:reset": "node scripts/reset-db.js"
+    "db:reset": "node scripts/reset-db.js",
+    "chain:demo": "node scripts/chain-demo.js",
+    "chain:repair": "node scripts/chain-repair.js",
+    "chain:evaluate": "node scripts/evaluate-verification.js",
+    "chain:photos": "node scripts/make-sample-photos.js",
+    "chain:checkpoint": "node scripts/chain-checkpoint.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -29,7 +31,8 @@
     "express-rate-limit": "^7.5.0",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@nomicfoundation/hardhat-chai-matchers": "^2.0.8",
@@ -38,6 +41,9 @@
     "@openzeppelin/contracts": "^5.1.0",
     "chai": "^4.5.0",
     "hardhat": "^2.22.17",
-    "supertest": "^7.0.0"
+    "jsqr": "^1.4.0",
+    "sharp": "^0.33.5",
+    "supertest": "^7.0.0",
+    "tesseract.js": "^5.1.1"
   }
 }
