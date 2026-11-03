@@ -59,7 +59,7 @@ const STUDENT = {
   it('applies migrations once and records them', async () => {
     await createPgStore(scopedUrl()).then((s) => s.close()); // second run is a no-op
     const { rows } = await admin.query(`SELECT name FROM ${schema}.schema_migrations`);
-    expect(rows.map((r) => r.name)).to.deep.equal(['001_init.sql', '002_lock_down_public_api.sql', '003_institutions_and_students.sql', '004_academic_registry.sql']);
+    expect(rows.map((r) => r.name)).to.deep.equal(['001_init.sql', '002_lock_down_public_api.sql', '003_institutions_and_students.sql', '004_academic_registry.sql', '005_own_blockchain.sql']);
     const rls = await admin.query(
       `SELECT relname, relrowsecurity FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
        WHERE n.nspname = $1 AND relkind = 'r'`,
