@@ -13,10 +13,9 @@
 //   6. Chain status revoked -> revoked. Otherwise -> valid.
 // OCR misreads letters, so names allow small differences; numbers do not.
 
-import crypto from 'node:crypto';
 import { degreeCanonical, marksString, parseQrPayload, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
 
-const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
+import { sha256 } from '../blockchain/index.js';
 const SERIAL = /\b([A-Za-z]{2,10})\s*\/\s*(P?D?DC|PDC|DC)\s*\/\s*([0-9OoIlSB]{4})\s*\/\s*([0-9OoIlSB]{6})\b/;
 const COR_ID = /\b(COR-\d{4}-[A-Za-z0-9]{4,12})\b/i;
 

@@ -2,7 +2,6 @@
 // frontend's src/lib/mockApi.js so the React app can switch between the mock
 // and this backend without changing any page code.
 
-import nodeCrypto from 'node:crypto';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -11,6 +10,7 @@ import { buildCertificateBytes, computeSha256Hex } from '../../src/lib/generateC
 import { ChainUnavailableError, ContractRevertError } from './chain.js';
 import { buildMerkleTree, leafOf } from './merkle.js';
 import { verifyCertificateEvidence } from './photoVerify.js';
+import { sha256 } from '../blockchain/index.js';
 import { issuedCanonical, marksString, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
 import { createInstitutionService } from './institutions.js';
 import { hashPassword } from './passwords.js';
@@ -44,7 +44,6 @@ class HttpError extends Error {
   }
 }
 
-const sha256Hex = (text) => nodeCrypto.createHash('sha256').update(text).digest('hex');
 const randomHex = (bytes) => Buffer.from(crypto.getRandomValues(new Uint8Array(bytes))).toString('hex');
 const today = () => new Date().toISOString().slice(0, 10);
 const asyncRoute = (fn) => (req, res, next) => fn(req, res, next).catch(next);
@@ -133,14 +132,14 @@ export function createApp({
     const marks = degree ? await store.getMarks(degree.enrollment_id) : null;
     if (marks) Object.assign(view, { semesters: marks.semesters, batch: marks.batch, medium: marks.medium });
     const onChain = await chain.getById(view.credentialId);
-    const hash = sha256Hex(view.canonical);
+    const hash = sha256(view.canonical);
     return {
       view,
       hash,
       txId: onChain?.txId ?? null,
       block: onChain?.block ?? null,
       status: onChain?.status ?? 'unknown',
-      marksVerified: Boolean(marks && onChain?.marksHash && sha256Hex(marksString(marks.semesters)) === onChain.marksHash),
+      marksVerified: Boolean(marks && onChain?.marksHash && sha256(marksString(marks.semesters)) === onChain.marksHash),
     };
   }
 
@@ -159,7 +158,7 @@ export function createApp({
     };
     // The printed reference is derived, not random, so a retried issue rebuilds
     // exactly the same certificate file and file hash.
-    fields.txHash = body.txHash ? String(body.txHash) : `0x${sha256Hex(`certificate-ref|${fields.credentialId}|${issuerName}`)}`;
+    fields.txHash = body.txHash ? String(body.txHash) : `0x${sha256(`certificate-ref|${fields.credentialId}|${issuerName}`)}`;
     const missing = ['studentName', 'studentId', 'credentialType'].filter((k) => !fields[k]);
     if (missing.length) throw new HttpError(400, `Missing required field(s): ${missing.join(', ')}.`);
     if (['studentName', 'studentId', 'credentialType'].some((k) => fields[k].length > MAX_TEXT)) {
@@ -218,7 +217,7 @@ export function createApp({
       (await issuedEarlier(fields.credentialId, hash, institution)) ??
       (await bridge.issue(fields.credentialId, hash, {
         certNo: fields.credentialId,
-        certHash: sha256Hex(issuedCanonical(fields)),
+        certHash: sha256(issuedCanonical(fields)),
       }));
     const record = await store.insert({
       ...fields,
@@ -726,7 +725,7 @@ export function createApp({
             credentialId: f.credentialId,
             certNo: f.credentialId,
             hash: hashes[i],
-            certHash: sha256Hex(issuedCanonical(f)),
+            certHash: sha256(issuedCanonical(f)),
           }))
         );
         const contract = await chain.address();
