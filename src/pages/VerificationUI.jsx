@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import {
   Camera,
@@ -40,6 +40,9 @@ const TABS = [
   { key: 'profile', label: 'Candidate Profile', icon: UserSearch },
 ];
 
+import DirectChainCheck from '../components/DirectChainCheck';
+import { parseQrPayload } from '../lib/certificateView';
+
 export default function VerificationUI() {
   const { notify } = useToast();
   const [searchParams] = useSearchParams();
@@ -55,6 +58,11 @@ export default function VerificationUI() {
   const autoVerifiedRef = useRef(false);
 
   const prefilledId = searchParams.get('credentialId');
+  // A marks card QR with "#cid=...&k=..." is checked in the browser only (IPFS + Ethereum).
+  const direct = useMemo(() => {
+    const qr = parseQrPayload(window.location.href);
+    return USE_BACKEND && qr?.ipfs ? qr : null;
+  }, []);
 
   useEffect(() => {
     if (prefilledId) setIdValue(prefilledId);
@@ -105,7 +113,7 @@ export default function VerificationUI() {
   // instant — the ID is already known, so there's no reason to make the
   // recruiter click Verify again.
   useEffect(() => {
-    if (prefilledId && !autoVerifiedRef.current) {
+    if (prefilledId && !direct && !autoVerifiedRef.current) {
       autoVerifiedRef.current = true;
       runVerify({ credentialId: prefilledId }, { type: 'id', value: prefilledId });
     }
@@ -126,6 +134,7 @@ export default function VerificationUI() {
 
   return (
     <div className="max-w-3xl mx-auto px-4 sm:px-5 py-8">
+      {direct && <DirectChainCheck qr={direct} />}
       <Hero
         onVerifyCredential={() => {
           setTab('id');
@@ -594,8 +603,9 @@ function ExplainerCollapsible() {
             ))}
           </div>
           <p className="text-[11px] text-ink-soft bg-bg border border-border rounded-md px-3 py-2.5">
-            Current prototype: credential records and blockchain anchoring are simulated. SHA-256
-            document fingerprinting is performed locally, for real, in your browser.
+            {USE_BACKEND
+              ? 'Checked against the CredentialRegistry smart contract on Ethereum Sepolia. Synthetic student data.'
+              : 'Demo mode: records and blockchain transactions are simulated in this browser. SHA-256 fingerprints are computed for real.'}
           </p>
         </div>
       )}

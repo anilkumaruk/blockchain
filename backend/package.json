@@ -19,11 +19,8 @@
     "db:check": "node scripts/db-check.js",
     "import:karnataka": "node scripts/import-karnataka.js",
     "db:reset": "node scripts/reset-db.js",
-    "chain:demo": "node scripts/chain-demo.js",
-    "chain:repair": "node scripts/chain-repair.js",
-    "chain:evaluate": "node scripts/evaluate-verification.js",
-    "chain:photos": "node scripts/make-sample-photos.js",
-    "chain:checkpoint": "node scripts/chain-checkpoint.js"
+    "chain:evaluate": "hardhat run scripts/evaluate-verification.js",
+    "chain:photos": "hardhat run scripts/make-sample-photos.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

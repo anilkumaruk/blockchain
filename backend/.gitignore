@@ -8,3 +8,4 @@ certs/*
 data/karnataka/TEST_LOGINS.md
 coverage
 coverage.json
+data/karnataka/TEST_WALLETS.json

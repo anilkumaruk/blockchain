@@ -121,7 +121,8 @@ export default function QrScanTab({ onFallback }) {
     if (detected.parsed.type === 'profile') {
       navigate(`/profile/${encodeURIComponent(detected.parsed.studentId)}`);
     } else {
-      navigate(`/verify?credentialId=${encodeURIComponent(detected.parsed.credentialId)}`);
+      if (detected.parsed.link) window.location.assign(detected.parsed.link);
+      else navigate(`/verify?credentialId=${encodeURIComponent(detected.parsed.credentialId)}`);
     }
   };
 

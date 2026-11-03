@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { Building2, CheckCircle2 } from 'lucide-react';
 import Spinner from '../components/Spinner';
 import { registerInstitution, USE_BACKEND } from '../lib/api';
+import { connectedAddress } from '../lib/wallet';
 
 const INPUT =
   'w-full rounded-md border border-border bg-white px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-teal/30 focus:border-teal';
@@ -14,12 +15,12 @@ const KINDS = [
 ];
 
 /**
- * Self-service registration for colleges and other issuers. New institutions
- * stay "pending" until the platform administrator approves them; approval
- * creates their own on-chain issuer wallet.
+ * Self-service registration for colleges and other issuers. The institution
+ * gives the MetaMask address it will sign with; it stays "pending" until the
+ * platform administrator authorises that address in the smart contract.
  */
 export default function InstitutionRegister() {
-  const [form, setForm] = useState({ name: '', kind: 'university', email: '', website: '', password: '', confirm: '' });
+  const [form, setForm] = useState({ name: '', kind: 'university', email: '', website: '', walletAddress: '', password: '', confirm: '' });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [done, setDone] = useState(null);
@@ -30,6 +31,7 @@ export default function InstitutionRegister() {
     e.preventDefault();
     setError('');
     if (!form.name.trim() || !form.email.trim()) return setError('Enter the institution name and official email.');
+    if (!/^0x[0-9a-fA-F]{40}$/.test(form.walletAddress.trim())) return setError('Enter the MetaMask address your institution will sign with.');
     if (form.password.length < 8) return setError('Use at least 8 characters for the password.');
     if (form.password !== form.confirm) return setError('The two passwords do not match.');
     setLoading(true);
@@ -39,6 +41,7 @@ export default function InstitutionRegister() {
         kind: form.kind,
         email: form.email.trim(),
         website: form.website.trim() || undefined,
+        walletAddress: form.walletAddress.trim(),
         password: form.password,
       });
       setDone(res.institution);
@@ -65,7 +68,7 @@ export default function InstitutionRegister() {
           <h1 className="text-lg font-semibold mb-1">Registration received</h1>
           <p className="text-sm text-ink-soft mb-5">
             <span className="font-medium text-ink">{done.name}</span> is pending approval. Once the platform
-            administrator approves it, your institution gets its own blockchain issuer identity and you can sign in to
+            administrator authorises your MetaMask address in the smart contract, you can sign in to
             the Credential Center with <span className="font-medium text-ink">{form.email.trim()}</span>.
           </p>
           <Link to="/admin" className="text-sm text-teal font-medium hover:underline">
@@ -118,6 +121,28 @@ export default function InstitutionRegister() {
               Website <span className="font-normal">(optional)</span>
             </label>
             <input id="inst-website" type="url" value={form.website} onChange={update('website')} placeholder="https://college.edu" className={INPUT} />
+          </div>
+          <div>
+            <label htmlFor="inst-wallet" className="block text-xs font-medium text-ink-soft mb-1.5">
+              MetaMask address <span className="font-normal">(signs every certificate you issue)</span>
+            </label>
+            <div className="flex gap-2">
+              <input id="inst-wallet" value={form.walletAddress} onChange={update('walletAddress')} placeholder="0x…" className={`${INPUT} font-mono`} />
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    const address = await connectedAddress();
+                    setForm((f) => ({ ...f, walletAddress: address }));
+                  } catch (err) {
+                    setError(err.message);
+                  }
+                }}
+                className="shrink-0 text-xs font-medium border border-border rounded-md px-3 hover:bg-bg"
+              >
+                Use MetaMask
+              </button>
+            </div>
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div>

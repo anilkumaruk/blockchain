@@ -37,6 +37,7 @@ import {
 import StudentAuth from '../components/StudentAuth';
 import { downloadCertificatePdf, downloadVerifiedResumePdf } from '../lib/generateCertificatePdf';
 import { downloadCertificateImage } from '../lib/certificateSvg';
+import WalletAppCard from '../components/WalletAppCard';
 import {
   buildStudentProfile,
   groupCredentialsByYear,
@@ -138,6 +139,8 @@ function StudentPortalView({ studentId, account, loadCredentials, onSignOut }) {
       />
 
       <StatsRow stats={profile.stats} />
+
+      {USE_BACKEND && <WalletAppCard />}
 
       <VerificationStatusCard profile={profile} />
 

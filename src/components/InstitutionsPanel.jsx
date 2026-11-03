@@ -21,9 +21,9 @@ const KIND_LABEL = {
 
 /**
  * Platform admin view: approve institutions that registered themselves.
- * Approving creates the institution's own issuer wallet and authorizes it on
- * the registry contract; suspending revokes that authorization, so every
- * credential it issued stops verifying as trusted.
+ * Approving signs setIssuer(wallet, name, true) in the admin's MetaMask (the
+ * contract owner); suspending signs it with false, so every credential the
+ * institution issued stops verifying as trusted.
  */
 export default function InstitutionsPanel() {
   const { notify } = useToast();
@@ -55,7 +55,7 @@ export default function InstitutionsPanel() {
       await setInstitutionStatus(inst.id, action);
       notify(
         action === 'approve'
-          ? `${inst.name} approved — issuer wallet authorized on-chain.`
+          ? `${inst.name} approved — its MetaMask wallet is now an issuer in the smart contract.`
           : action === 'suspend'
           ? `${inst.name} suspended — its credentials no longer verify as trusted.`
           : `${inst.name} rejected.`,
@@ -113,7 +113,7 @@ export default function InstitutionsPanel() {
                   {inst.walletAddress ? (
                     <span className="font-mono">issuer {shortenHash(inst.walletAddress)}</span>
                   ) : (
-                    <span>no issuer wallet</span>
+                    <span>no wallet address</span>
                   )}
                   {inst.website && (
                     <a

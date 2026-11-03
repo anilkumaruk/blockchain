@@ -1,37 +1,44 @@
 // Imports the Karnataka Degree Registry (data/karnataka/*.json) into the
-// database and records every degree certificate on the project's own blockchain:
-//   - each university becomes an approved institution with its own signing key
-//   - each certificate is an ISSUE transaction signed by its university, in
-//     blocks of up to 25 transactions, carrying the dataset's canonical SHA-256
-//   - REVOKED / WITHHELD / CANCELLED_DUPLICATE_ISSUED certificates then get a
-//     REVOKE transaction with the dataset's reason
+// database and records every degree certificate in the CredentialRegistry
+// smart contract on Ethereum:
+//   - each university gets its own test wallet; the platform (contract owner)
+//     authorises it with setIssuer and sends it a little test ETH for gas
+//   - each university signs ONE Merkle batch (anchorBatch) covering all its
+//     certificates; every certificate keeps its Merkle proof in the database.
+//     The leaf is the certificate's document hash: SHA-256 of its canonical
+//     line plus every semester row (server/hash.js)
+//   - REVOKED / WITHHELD / CANCELLED_DUPLICATE_ISSUED certificates are revoked
+//     by their own university (revokeBatchCredential) with the dataset's reason
 //   - all academic tables (colleges, programs, students, enrollments,
 //     semester results, NAD export, verification requests) are loaded
-//   - 5 admin and 15 student test logins are created; their generated
-//     passwords are written to data/karnataka/TEST_LOGINS.md (git-ignored)
+//   - 1 platform admin, 5 university admin and 15 student test logins are
+//     created; passwords and the universities' MetaMask test keys are written
+//     to data/karnataka/TEST_LOGINS.md and TEST_WALLETS.json (git-ignored)
 //
-//   npm run import:karnataka
+//   npm run import:karnataka        (CHAIN_NETWORK=localhost or sepolia)
 //
-// Resumable: if a run is interrupted (network, RPC, database), just run it
-// again. Every phase skips what is already done - universities and wallets are
-// reused, rows are inserted with ON CONFLICT DO NOTHING, universities whose
-// certificates are already anchored are skipped, revoked certificates are not
-// revoked twice, and existing test accounts get fresh passwords.
-// For a clean start run `node scripts/reset-db.js --confirm` first.
+// This is an operator tool run on your own machine: it signs with the
+// platform owner's key (DEPLOYER_PRIVATE_KEY, or Hardhat's public dev key on
+// localhost) and the universities' test keys. The API server never holds keys.
+//
+// Resumable: if a run is interrupted, run it again. Every phase skips what is
+// already done (authorised issuers, anchored universities, revoked certificates).
+// For a clean start: node scripts/reset-db.js --confirm, then deploy a new contract.
 
 import 'dotenv/config';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadConfig } from '../server/config.js';
-import { createLedgerFor } from '../server/runtime.js';
+import { Contract, JsonRpcProvider, NonceManager, Wallet, formatEther, keccak256, parseEther, toUtf8Bytes } from 'ethers';
+import { HARDHAT_DEV_KEY, loadConfig } from '../server/config.js';
 import { createPgStore } from '../server/store.js';
-import { createInstitutionService } from '../server/institutions.js';
+import { slugify } from '../server/institutions.js';
 import { hashPassword, verifyPassword } from '../server/passwords.js';
-import { slugify } from '../server/wallets.js';
-import { buildCertificateBytes, computeSha256Hex } from '../../src/lib/generateCertificatePdf.js';
-import { marksString } from '../../src/lib/certificateView.js';
+import { documentHash } from '../server/hash.js';
+import { buildMerkleTree, leafOf } from '../server/merkle.js';
+import { normalizeReason } from '../server/app.js';
+import { degreeCanonical } from '../../src/lib/certificateView.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const DATA = path.join(here, '..', 'data', 'karnataka');
@@ -45,18 +52,30 @@ if (errors.length || config.useMemoryStore) {
 }
 
 const store = await createPgStore(config.databaseUrl, { ssl: config.databaseSsl });
-const ledger = createLedgerFor(config, store);
-const authorityBridge = ledger.bridge(config.issuerKey);
-const contractAddress = await authorityBridge.address();
-const institutions = createInstitutionService({
-  chain: authorityBridge,
-  connect: (pk) => ledger.bridge(pk),
-  store,
-  walletKey: config.walletKey,
-  fundingWei: config.fundingWei,
-  rootName: config.institutionName,
-  trustedIssuer: config.trustedIssuer,
-});
+const deployment = JSON.parse(fs.readFileSync(path.join(here, '..', 'deployments', `${config.network}.json`), 'utf8'));
+const provider = new JsonRpcProvider(config.rpcUrl, deployment.chainId, { staticNetwork: true });
+const ownerKey = config.network === 'localhost' ? HARDHAT_DEV_KEY : process.env.DEPLOYER_PRIVATE_KEY;
+if (!ownerKey) {
+  console.error('Set DEPLOYER_PRIVATE_KEY (the contract owner) in backend/.env to import onto Sepolia.');
+  process.exit(1);
+}
+const owner = new NonceManager(new Wallet(ownerKey, provider));
+const asOwner = new Contract(deployment.address, deployment.abi, owner);
+console.log(`Contract ${deployment.address} on ${config.network}; owner ${await owner.getAddress()}`);
+
+// Each university's MetaMask test key. Generated once and kept, so reruns and
+// the registrars' MetaMask imports keep working.
+const walletsFile = path.join(DATA, 'TEST_WALLETS.json');
+const walletKeys = fs.existsSync(walletsFile) ? JSON.parse(fs.readFileSync(walletsFile, 'utf8')) : {};
+const signerFor = (univId) => {
+  if (!walletKeys[univId]) {
+    walletKeys[univId] = Wallet.createRandom().privateKey;
+    fs.writeFileSync(walletsFile, JSON.stringify(walletKeys, null, 2), { mode: 0o600 });
+  }
+  return new NonceManager(new Wallet(walletKeys[univId], provider));
+};
+const FUNDING = parseEther(process.env.UNIVERSITY_FUNDING_ETH || (config.network === 'localhost' ? '1' : '0.0005'));
+const mined = async (txPromise) => (await txPromise).wait();
 
 const yn = (v) => (v === 'Y' ? true : v === 'N' ? false : null);
 const isoDate = (v) => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v) ? v : null);
@@ -75,42 +94,30 @@ async function insertRows(table, columns, rows, chunk = 400) {
   console.log(`  ${table.padEnd(22)} ${rows.length}`);
 }
 
-// ---- universities -> institutions (each with its own issuer wallet) ------
+// ---- universities -> approved institutions with their own wallet -------------
 console.log('Universities');
-const rootRow = await institutions.root();
 const univById = new Map();
+const signerByUniv = new Map();
 for (const u of load('universities')) {
-  const attrs = {
-    kind: 'university',
-    website: null,
-    source: SOURCE,
-    sourceRef: u.univ_id,
-    shortCode: u.short_code,
-    univType: u.univ_type,
-    regulator: u.regulator,
-    city: u.city,
-    state: u.state,
-    pincode: u.pincode,
-    establishedYear: u.established_year,
-    gradingSystem: u.grading_system,
-    aisheCode: u.aishe_code,
-    ugcRecognised: yn(u.ugc_recognised),
-  };
-  let inst;
+  const signer = signerFor(u.univ_id);
+  const address = await signer.getAddress();
   const id = slugify(u.univ_name);
-  if (id === rootRow.id) {
-    inst = await store.updateInstitution(rootRow.id, attrs); // the platform owner itself
-  } else {
-    // Resumable: an interrupted run may already have created / approved it.
-    if (!(await store.getInstitution(id))) {
-      await store.createInstitution({ id, name: u.univ_name, status: 'pending', ...attrs });
-    }
-    const current = await store.getInstitution(id);
-    inst = current.status === 'approved' ? current : await institutions.approve(id, `import:${SOURCE}`);
-  }
-  univById.set(u.univ_id, await store.getInstitution(inst.id));
-  console.log(`  ${u.short_code.padEnd(8)} ${inst.walletAddress}  ${u.univ_name}`);
+  const attrs = {
+    kind: 'university', website: null, source: SOURCE, sourceRef: u.univ_id, shortCode: u.short_code, univType: u.univ_type,
+    regulator: u.regulator, city: u.city, state: u.state, pincode: u.pincode, establishedYear: u.established_year,
+    gradingSystem: u.grading_system, aisheCode: u.aishe_code, ugcRecognised: yn(u.ugc_recognised),
+  };
+  if (!(await store.getInstitution(id))) await store.createInstitution({ id, name: u.univ_name, status: 'pending', ...attrs });
+  // The platform authorises the university's wallet in the contract...
+  if (!(await asOwner.issuers(address)).active) await mined(asOwner.setIssuer(address, u.univ_name, true));
+  // ...and gives it a little test ETH so it can pay for its own transactions.
+  if ((await provider.getBalance(address)) < FUNDING / 2n) await mined(owner.sendTransaction({ to: address, value: FUNDING }));
+  await store.updateInstitution(id, { walletAddress: address, walletKeyEnc: null, status: 'approved', approvedBy: `import:${SOURCE}`, ...attrs });
+  univById.set(u.univ_id, await store.getInstitution(id));
+  signerByUniv.set(u.univ_id, signer);
+  console.log(`  ${u.short_code.padEnd(8)} ${address}  ${u.univ_name}`);
 }
+console.log(`  owner balance left: ${formatEther(await provider.getBalance(await owner.getAddress()))} ETH`);
 const instId = (univId) => univById.get(univId).id;
 
 const certs = load('degree_certificates');
@@ -169,8 +176,8 @@ await insertRows(
   800
 );
 
-// ---- degree certificates -> on-chain credentials (one Merkle batch per university)
-console.log('Degree certificates -> blockchain');
+// ---- degree certificates -> one Merkle batch per university, signed by it -----
+console.log('Degree certificates -> smart contract');
 const groupByEnrollment = (rows) => {
   const map = new Map();
   for (const r of rows) map.set(r.enrollment_id, [...(map.get(r.enrollment_id) ?? []), r]);
@@ -178,122 +185,95 @@ const groupByEnrollment = (rows) => {
 };
 const credIdOf = (no) => no.replace(/\//g, '-');
 const semestersByEnrollment = groupByEnrollment(load('semester_results'));
-const marksHashOf = (enrollmentId) => {
-  const rows = semestersByEnrollment.get(enrollmentId);
-  return rows ? crypto.createHash('sha256').update(marksString(rows)).digest('hex') : null;
-};
+const univName = new Map(load('universities').map((u) => [u.univ_id, u.univ_name]));
 const byCertNo = new Map(certs.map((d) => [certNo(d), d]));
 const credentialOf = new Map(); // certificate_id -> credential record
+const batchEvent = (receipt) =>
+  receipt.logs.map((l) => { try { return asOwner.interface.parseLog(l); } catch { return null; } }).find((e) => e?.name === 'BatchAnchored');
 
 for (const [univId, inst] of univById) {
   const mine = certs.filter((d) => d.univ_id === univId);
   if (!mine.length) continue;
-  // Already anchored and recorded by an earlier run? insertMany is all-or-nothing.
   const done = await store.raw('SELECT * FROM credentials WHERE institution_id = $1', [inst.id]);
   if (done.rows.length === mine.length) {
     const byNo = new Map(done.rows.map((r) => [r.certificate_no, r]));
     for (const d of mine) {
       const r = byNo.get(certNo(d));
-      credentialOf.set(d.certificate_id, {
-        credentialId: r.credential_id,
-        hash: r.doc_hash,
-        issueDate: r.issue_date,
-        status: r.status,
-      });
+      credentialOf.set(d.certificate_id, { credentialId: r.credential_id, hash: r.doc_hash, batch: r.batch, issueDate: r.issue_date, status: r.status });
     }
     console.log(`  ${inst.shortCode.padEnd(8)} already anchored (${mine.length}), skipped`);
     continue;
   }
-  const fieldsList = mine.map((d) => ({
-    credentialId: credIdOf(certNo(d)),
+  // The document hash of each certificate, exactly as the API and the photo check recompute it.
+  const hashes = mine.map((d) => documentHash(degreeCanonical(d), semestersByEnrollment.get(d.enrollment_id) ?? []));
+  const ids = mine.map((d) => credIdOf(certNo(d)));
+  const tree = buildMerkleTree(mine.map((_, i) => leafOf(ids[i], hashes[i])));
+  const asUniversity = new Contract(deployment.address, deployment.abi, signerByUniv.get(univId));
+  const receipt = await mined(asUniversity.anchorBatch(tree.root, mine.length));
+  const batchId = Number(batchEvent(receipt).args.batchId);
+
+  const records = mine.map((d, i) => ({
+    credentialId: ids[i],
+    certificateNo: certNo(d),
     studentName: d.candidate_name,
     studentId: d.student_id,
-    credentialType:
-      `${d.degree_name}${d.branch && d.branch !== d.degree_name ? ` in ${d.branch}` : ''}${
-        d.certificate_status === 'PROVISIONAL_ONLY' ? ' (Provisional)' : ''
-      }`.slice(0, 200),
+    credentialType: `${d.degree_name}${d.branch && d.branch !== d.degree_name ? ` in ${d.branch}` : ''}${
+      d.certificate_status === 'PROVISIONAL_ONLY' ? ' (Provisional)' : ''
+    }`.slice(0, 200),
     issueDate: isoDate(d.date_of_issue) ?? isoDate(d.provisional_issue_date),
     issuer: inst.name,
-    txHash: '0x' + crypto.randomBytes(32).toString('hex'),
-  }));
-  const hashes = await Promise.all(fieldsList.map((f) => computeSha256Hex(buildCertificateBytes(f))));
-  const bridge = await institutions.bridgeFor(inst);
-  // Resumable: only submit what the chain does not hold yet.
-  const onChain = await Promise.all(fieldsList.map((f) => authorityBridge.getById(f.credentialId)));
-  const missing = fieldsList.map((f, i) => i).filter((i) => !onChain[i]);
-  const fresh = await bridge.issueMany(
-    missing.map((i) => ({
-      credentialId: fieldsList[i].credentialId,
-      certNo: certNo(mine[i]),
-      hash: hashes[i],
-      certHash: mine[i].sha256_hash, // SHA-256 of the registry's canonical string
-      marksHash: marksHashOf(mine[i].enrollment_id),
-    }))
-  );
-  const receiptOf = new Map(missing.map((i, n) => [i, fresh[n]]));
-  const receipt = (i) =>
-    receiptOf.get(i) ?? { txHash: `0x${onChain[i].txId}`, blockNumber: onChain[i].block, gasUsed: 0n };
-
-  const records = fieldsList.map((f, i) => ({
-    ...f,
-    certificateNo: certNo(mine[i]),
-    institutionId: inst.id,
-    issuerAddress: inst.walletAddress,
+    txHash: receipt.hash,
     hash: hashes[i],
     status: 'valid',
     revocation: null,
-    chain: {
-      mode: 'own-chain',
-      txHash: receipt(i).txHash,
-      blockNumber: receipt(i).blockNumber,
-      gasUsed: '0',
-      contract: contractAddress,
-      source: SOURCE,
-      sourceId: mine[i].certificate_id,
-    },
+    institutionId: inst.id,
+    issuerAddress: inst.walletAddress,
+    batch: { batchId, root: tree.root, proof: tree.proof(i), index: i },
+    chain: { mode: 'batch', network: config.network, contract: deployment.address, txHash: receipt.hash, blockNumber: receipt.blockNumber, source: SOURCE, sourceId: d.certificate_id },
   }));
   await store.insertMany(records);
   records.forEach((r, i) => credentialOf.set(mine[i].certificate_id, r));
-  const blockNumbers = records.map((r) => r.chain.blockNumber);
-  console.log(`  ${inst.shortCode.padEnd(8)} ${records.length} certificates in blocks ${Math.min(...blockNumbers)}-${Math.max(...blockNumbers)}`);
+  console.log(`  ${inst.shortCode.padEnd(8)} ${records.length} certificates, batch ${batchId}, block ${receipt.blockNumber}`);
 }
 
-// Revoke what the registry says is not valid, with the registry's reason.
+// Revoke what the registry says is not valid, signed by the issuing university with the registry's reason.
 let revoked = 0;
+const reasonOf = (d) => normalizeReason(d.certificate_status === 'WITHHELD' ? `Withheld: ${d.revocation_reason}` : d.revocation_reason);
 for (const [univId, inst] of univById) {
   const list = certs
     .filter((c) => c.univ_id === univId && ['REVOKED', 'WITHHELD', 'CANCELLED_DUPLICATE_ISSUED'].includes(c.certificate_status))
-    .filter((d) => credentialOf.get(d.certificate_id).status !== 'revoked')
-    .map((d) => ({
-      d,
-      rec: credentialOf.get(d.certificate_id),
-      reason: d.certificate_status === 'WITHHELD' ? `Withheld: ${d.revocation_reason}` : d.revocation_reason,
-    }));
-  const todo = [];
-  for (const item of list) {
-    if ((await authorityBridge.getById(item.rec.credentialId)).status !== 'revoked') todo.push(item);
+    .map((d) => ({ d, rec: credentialOf.get(d.certificate_id), reason: reasonOf(d) }))
+    .filter((t) => t.rec.status !== 'revoked');
+  if (!list.length) continue;
+  const asUniversity = new Contract(deployment.address, deployment.abi, signerByUniv.get(univId));
+  // Send them all, then wait: one block on Sepolia can hold many.
+  const pending = [];
+  for (const t of list) {
+    const { batchId, proof } = t.rec.batch;
+    const state = await asUniversity.verifyBatchCredential(batchId, t.rec.credentialId, t.rec.hash, proof);
+    if (Number(state.revokedAt) === 0) {
+      pending.push([t, await asUniversity.revokeBatchCredential(batchId, t.rec.credentialId, t.rec.hash, proof, keccak256(toUtf8Bytes(t.reason)))]);
+    } else pending.push([t, null]);
   }
-  const bridge = await institutions.bridgeFor(inst);
-  const receipts = await bridge.revokeMany(todo.map((t) => ({ credentialId: t.rec.credentialId, reason: t.reason })));
-  const receiptFor = new Map(todo.map((t, i) => [t, receipts[i]]));
-  for (const item of list) {
-    const r = receiptFor.get(item) ?? { txHash: null, blockNumber: null };
+  for (const [t, tx] of pending) {
+    const receipt = tx ? await tx.wait() : null;
     const patch = {
       status: 'revoked',
-      revocation: { reason: item.reason, date: item.rec.issueDate, txHash: r.txHash, blockNumber: r.blockNumber, gasUsed: '0' },
+      revocation: { reason: t.reason, date: t.rec.issueDate, txHash: receipt?.hash ?? null, blockNumber: receipt?.blockNumber ?? null },
     };
-    const superseded = /^Superseded by (\S+)/.exec(item.d.revocation_reason || '');
+    const superseded = /^Superseded by (\S+)/.exec(t.d.revocation_reason || '');
     if (superseded && byCertNo.has(superseded[1])) patch.replacedBy = credIdOf(superseded[1]);
-    await store.update(item.rec.credentialId, patch);
+    await store.update(t.rec.credentialId, patch);
     revoked++;
   }
+  console.log(`  ${inst.shortCode.padEnd(8)} revoked ${list.length}`);
 }
 // Duplicates issued for lost originals point back to the cancelled original.
 for (const d of certs) {
   const dup = /^Duplicate of (\S+)/.exec(d.revocation_reason || '');
   if (dup && byCertNo.has(dup[1])) await store.update(credentialOf.get(d.certificate_id).credentialId, { replaces: credIdOf(dup[1]) });
 }
-console.log(`  revoked on-chain: ${revoked}`);
+console.log(`  revoked in the contract: ${revoked}`);
 
 console.log('Registry tables');
 await insertRows(
@@ -444,6 +424,16 @@ async function createLogins({ reset }) {
     ...logins.map((l, i) => `| ${i + 1} | ${l.kind} | ${l.institution} | ${l.login} | ${l.password} | ${l.detail ?? ''} |`),
     '',
     'Platform admin and university admins sign in at /admin. Students sign in at /student.',
+    '',
+    '## MetaMask test wallets',
+    '',
+    'Every write is signed in MetaMask. Import the matching key (MetaMask > Add account > Import account),',
+    'switch MetaMask to Sepolia, and use that account in the Credential Center. Test keys holding only Sepolia test ETH.',
+    'The platform admin signs with the contract owner (deployer) account.',
+    '',
+    '| University | Address | Private key (test only) |',
+    '|---|---|---|',
+    ...[...univById].map(([univId, inst]) => `| ${inst.name} | ${inst.walletAddress} | ${walletKeys[univId]} |`),
     '',
   ].join('\n');
   fs.writeFileSync(loginFile, md);

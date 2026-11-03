@@ -28,7 +28,8 @@ export function parseChainOfRecordQr(text) {
     }
     // The QR on a marks card: /verify?credentialId=...&h=...
     const credentialId = url.pathname === '/verify' ? url.searchParams.get('credentialId') : null;
-    if (credentialId) return { type: 'credential', credentialId };
+    // The full link is kept: its "#cid=...&k=..." part lets the page check IPFS and the contract directly.
+    if (credentialId) return { type: 'credential', credentialId, link: `${url.pathname}${url.search}${url.hash}` };
   } catch {
     // Not URL-shaped at all — fall through to the raw credential ID check.
   }

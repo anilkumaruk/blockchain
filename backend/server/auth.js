@@ -69,7 +69,7 @@ export function createAuth({ jwtSecret, store, tokenTtl = '1h', maxAttempts = 5,
         sub: account.username,
         email: account.email ?? undefined,
         ...claims,
-        institution: institution ? { id: institution.id, name: institution.name } : undefined,
+        institution: institution ? { id: institution.id, name: institution.name, walletAddress: institution.walletAddress ?? null } : undefined,
       },
     };
   }

@@ -45,11 +45,11 @@ function qrSvg(text, x, y, size) {
 }
 
 /**
- * @param {object} card { view, hash, txId, block, status: 'valid'|'revoked', marksVerified }
+ * @param {object} card { view, hash, txId, block, status: 'valid'|'revoked', marksVerified, ipfs?: { cid, key } }
  * @param {{ origin: string, includeQr?: boolean }} options
  */
 export function certificateSvg(card, { origin, includeQr = true }) {
-  const { view, hash, txId, status = 'valid', marksVerified = false } = card;
+  const { view, hash, txId, block = null, status = 'valid', marksVerified = false, ipfs = null } = card;
   const revoked = status === 'revoked';
   const semesters = view.semesters ?? [];
   const rowH = 44;
@@ -116,7 +116,8 @@ export function certificateSvg(card, { origin, includeQr = true }) {
       const base = y + 30;
       if (i) parts.push(`<line x1="50" x2="1400" y1="${y}" y2="${y}" stroke="${LINE}"/>`);
       const cells = [`Sem ${s.semester}`, s.credits_earned, Number(s.sgpa).toFixed(2), String(s.result).split(' ')[0], s.backlogs];
-      cells.forEach((v, c) => parts.push(t((cols[c] + cols[c + 1]) / 2, base, v, { size: 29, anchor: 'middle', weight: c === 0 ? 'bold' : 'normal' })));
+      // SGPA in bold: with thin digits OCR misread values such as "7.71" on some cards.
+      cells.forEach((v, c) => parts.push(t((cols[c] + cols[c + 1]) / 2, base, v, { size: 29, anchor: 'middle', weight: c === 0 || c === 2 ? 'bold' : 'normal' })));
       const ok = marksVerified && !revoked;
       const cx = (cols[5] + cols[6]) / 2;
       parts.push(`<rect x="${cx - 88}" y="${y + 6}" width="176" height="31" rx="15" fill="${ok ? GREEN_SOFT : RED_SOFT}"/>`);
@@ -144,20 +145,20 @@ export function certificateSvg(card, { origin, includeQr = true }) {
   parts.push(box(1430, 316, 524, Math.max(footerY - 340, 500)));
   parts.push(cube(1500, 380, 26, PURPLE), cube(1470, 430, 22, PURPLE), cube(1530, 430, 22, PURPLE));
   parts.push(t(1576, 386, 'Blockchain', { size: 32, weight: 'bold', fill: NAVY }), t(1576, 426, 'Academic Credential', { size: 32, weight: 'bold', fill: NAVY }));
-  parts.push(t(1456, 490, 'Recorded on the Chain of Record blockchain.', { size: 22, fill: MUTED }));
+  parts.push(t(1456, 490, 'Recorded in a smart contract on Ethereum.', { size: 22, fill: MUTED }));
   parts.push(t(1456, 520, 'Tamper-evident and independently verifiable.', { size: 22, fill: MUTED }));
   parts.push(`<line x1="1430" x2="1954" y1="548" y2="548" stroke="${LINE}"/>`);
   parts.push(t(1456, 598, 'Verification Status', { size: 25, weight: 'bold' }));
   parts.push(`<rect x="1740" y="568" width="190" height="44" rx="22" fill="${revoked ? RED_SOFT : GREEN_SOFT}"/>`);
   parts.push(t(1835, 598, revoked ? 'Revoked' : 'Verified', { size: 25, weight: 'bold', fill: revoked ? RED : GREEN, anchor: 'middle' }));
-  parts.push(t(1456, 664, 'Blockchain Txn ID', { size: 25, weight: 'bold' }), t(1456, 698, shortHash(txId), { size: 24, fill: MUTED }));
+  parts.push(t(1456, 664, 'Ethereum Transaction', { size: 25, weight: 'bold' }), t(1456, 698, txId ? shortHash(txId) : block != null ? `Block #${block}` : '-', { size: 24, fill: MUTED }));
   parts.push(t(1456, 750, 'Document Hash', { size: 25, weight: 'bold' }), t(1456, 784, shortHash(hash), { size: 24, fill: MUTED }));
   parts.push(t(1456, 836, 'Credential ID', { size: 25, weight: 'bold' }), t(1456, 872, clip(view.certificateNo, 32), { size: 27, weight: 'bold', fill: INK }));
 
   // Footer
   parts.push(`<line x1="50" x2="1954" y1="${footerY}" y2="${footerY}" stroke="${LINE}"/>`);
-  const link = verifyUrl(origin, view.certificateNo, hash);
-  if (includeQr) parts.push(qrSvg(link, 44, footerY + 10, 200));
+  // The QR also carries the IPFS address and key (after "#"); the printed link does not.
+  if (includeQr) parts.push(qrSvg(verifyUrl(origin, view.certificateNo, hash, ipfs), 44, footerY + 10, 200));
   parts.push(t(270, footerY + 70, 'Scan to Verify', { size: 32, weight: 'bold' }));
   parts.push(t(270, footerY + 110, 'Scan this QR code or open the link', { size: 24, fill: MUTED }));
   parts.push(t(270, footerY + 142, 'to validate this marks card on the blockchain.', { size: 24, fill: MUTED }));

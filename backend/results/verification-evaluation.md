@@ -1,10 +1,10 @@
 # Verification evaluation: 666 labelled requests
 
-Generated 2026-11-02T06:04:35.787Z by `npm run chain:evaluate`.
-Chain used: 107 blocks, 1708 transactions, 1604 certificates.
-Input: each request's claimed details as text, and its QR hash. These cases test the verifier and the chain; OCR is measured separately in photo-ocr.md.
+Generated 2026-11-03T07:56:58.454Z by `npm run chain:evaluate`.
+Contract used: CredentialRegistry on Hardhat's in-process Ethereum, 17 Merkle batches (one per university), 1604 certificates, 86 revoked.
+Input: each request's claimed details as text, and its QR hash (a QR matching the dataset's own hash is treated as the genuine QR). These cases test the verifier and the contract; OCR is measured separately in photo-ocr.md.
 
-**Accuracy: 666/666 (100.00%)**, 4.99 ms per verification.
+**Accuracy: 666/666 (100.00%)**, 0.51 ms per verification.
 
 | Expected \ Result | valid | invalid | revoked |
 |---|---:|---:|---:|

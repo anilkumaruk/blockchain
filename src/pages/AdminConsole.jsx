@@ -1447,8 +1447,9 @@ function HowIssuanceWorks() {
             ))}
           </div>
           <p className="text-[11px] text-ink-soft bg-bg border border-border rounded-md px-3 py-2.5">
-            Current prototype: blockchain anchoring is simulated. Document integrity uses SHA-256
-            fingerprint verification, performed locally.
+            {USE_BACKEND
+              ? 'Checked against the CredentialRegistry smart contract on Ethereum Sepolia. Synthetic student data.'
+              : 'Demo mode: records and blockchain transactions are simulated in this browser. SHA-256 fingerprints are computed for real.'}
           </p>
         </div>
       )}

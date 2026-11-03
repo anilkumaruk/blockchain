@@ -2,6 +2,8 @@
 // Same exported functions and response shapes as mockApi.js, so pages don't
 // care which one they're talking to — src/lib/api.js picks between them.
 
+import { reasonHash, sendTransaction } from './wallet';
+
 export { fakeCredentialId, fakeTxHash, DEMO_STUDENT_ID } from './mockApi';
 
 const BASE_URL = String(import.meta.env.VITE_API_URL || '').replace(/\/$/, '');
@@ -73,8 +75,26 @@ export async function login(username, password, roles = ['admin', 'institution']
   return session;
 }
 
-export function issueCredential(fields) {
-  return http('/credentials', { method: 'POST', body: fields, auth: true });
+/**
+ * Issue: the server prepares the document hash, the registrar signs
+ * issueCredential in MetaMask, and the server records it once the contract
+ * shows it. `onStep` reports progress for the UI.
+ */
+export async function issueCredential(fields, onStep = () => {}) {
+  onStep('Preparing the document hash');
+  const prep = await http('/credentials/prepare', { method: 'POST', body: fields, auth: true });
+  let txHash = null;
+  if (!prep.alreadyOnChain) {
+    onStep('Confirm the transaction in MetaMask');
+    const { receipt } = await sendTransaction('issueCredential', [prep.credentialId, prep.docHash], prep.issuerAddress);
+    txHash = receipt.hash;
+  }
+  onStep('Recording it');
+  return http('/credentials', {
+    method: 'POST',
+    body: { ...prep.fields, studentEmail: fields.studentEmail, replaces: fields.replaces, txHash },
+    auth: true,
+  });
 }
 
 export function getCredentialsForStudent(studentId) {
@@ -88,12 +108,14 @@ export async function getAllCredentials() {
   return http('/credentials', { auth: true });
 }
 
-export function revokeCredential(credentialId, reason) {
-  return http(`/credentials/${encodeURIComponent(credentialId)}/revoke`, {
-    method: 'POST',
-    body: { reason },
-    auth: true,
-  });
+/** Revoke: signed in MetaMask by the issuing university, then recorded. */
+export async function revokeCredential(credentialId, reason) {
+  const record = await http(`/credentials/${encodeURIComponent(credentialId)}`);
+  const why = reasonHash(reason);
+  await (record.batch
+    ? sendTransaction('revokeBatchCredential', [record.batch.batchId, credentialId, record.hash, record.batch.proof, why], record.issuerAddress)
+    : sendTransaction('revokeCredential', [credentialId, why], record.issuerAddress));
+  return http(`/credentials/${encodeURIComponent(credentialId)}/revoke`, { method: 'POST', body: { reason }, auth: true });
 }
 
 export function verifyCredential({ credentialId, fileHash }) {
@@ -122,12 +144,6 @@ export function logout() {
 }
 
 export const verifyPhoto = (evidence) => http('/verify/photo', { method: 'POST', body: evidence });
-export const getChainSummary = () => http('/chain/summary');
-export const getChainBlocks = (from, limit = 12) =>
-  http(`/chain/blocks?limit=${limit}${from == null ? '' : `&from=${from}`}`);
-export const getChainBlock = (index) => http(`/chain/blocks/${index}`);
-export const auditChain = () => http('/chain/audit');
-export const simulateTamper = (block) => http('/chain/simulate-tamper', { method: 'POST', body: { block } });
 export const getMyCertificates = () => http('/me/certificates', { auth: true });
 export const getCertificateForIssuer = (id) => http(`/credentials/${encodeURIComponent(id)}/certificate`, { auth: true });
 
@@ -147,12 +163,28 @@ export function listInstitutionsAdmin() {
   return http('/admin/institutions', { auth: true });
 }
 
-export function setInstitutionStatus(id, action) {
+/** Approve / suspend: the platform admin signs setIssuer in MetaMask (as the contract owner). */
+export async function setInstitutionStatus(id, action) {
+  if (action === 'approve' || action === 'suspend') {
+    const inst = (await listInstitutionsAdmin()).find((i) => i.id === id);
+    if (!inst?.walletAddress) throw new Error('This institution has no wallet address.');
+    const { owner } = await getRegistryStatus();
+    await sendTransaction('setIssuer', [inst.walletAddress, inst.name, action === 'approve'], owner);
+  }
   return http(`/admin/institutions/${encodeURIComponent(id)}/${action}`, { method: 'POST', auth: true });
 }
 
-export function issueBatch(credentials) {
-  return http('/credentials/batch', { method: 'POST', body: { credentials }, auth: true });
+/** Merkle batch: one root signed once in MetaMask covers the whole list. */
+export async function issueBatch(credentials) {
+  const prep = await http('/credentials/batch/prepare', { method: 'POST', body: { credentials }, auth: true });
+  const issuer = session?.institution?.walletAddress ?? (await http('/me', { auth: true })).institution?.walletAddress;
+  const { receipt, contract } = await sendTransaction('anchorBatch', [prep.root, prep.count], issuer);
+  const event = receipt.logs.map((l) => { try { return contract.interface.parseLog(l); } catch { return null; } }).find((e) => e?.name === 'BatchAnchored');
+  return http('/credentials/batch', {
+    method: 'POST',
+    body: { credentials: prep.credentials, batchId: Number(event.args.batchId), txHash: receipt.hash },
+    auth: true,
+  });
 }
 
 export function getCredentialHistory(credentialId) {
@@ -167,6 +199,9 @@ export function getRegistryStatus() {
   return http('/admin/registry', { auth: true });
 }
 
-export function setRegistryPaused(paused) {
+/** Emergency pause: signed by the contract owner in MetaMask, then recorded. */
+export async function setRegistryPaused(paused) {
+  const { owner } = await getRegistryStatus();
+  await sendTransaction(paused ? 'pause' : 'unpause', [], owner);
   return http('/admin/pause', { method: 'POST', body: { paused }, auth: true });
 }

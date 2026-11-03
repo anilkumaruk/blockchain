@@ -1,0 +1,15 @@
+{
+  "name": "Chain of Record - Student Wallet",
+  "short_name": "Chain of Record",
+  "description": "Your blockchain-verified academic credentials: show their QR code, share them, verify certificates.",
+  "start_url": "/student",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f5fb",
+  "theme_color": "#5b3fa8",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { Ban, Check, CheckCircle2, ChevronDown, ImageUp, Link2, ScanText, X, XCircle } from 'lucide-react';
 import Spinner from './Spinner';
+import { txLink } from '../lib/wallet';
 import { shortenHash } from './CredentialDNA';
 import { verifyPhoto } from '../lib/api';
 import { readCertificatePhoto } from '../lib/photoEvidence';
@@ -22,22 +22,26 @@ const VERDICTS = {
 };
 
 function Proof({ result }) {
-  const { proof, hash, issuer, consensus } = result;
+  const { proof, hash, issuer } = result;
   if (!proof) return null;
-  const walk = proof.chainWalk;
+  const tx = txLink(proof.txHash);
   const rows = [
-    ['Recorded in block', <Link key="b" to={`/chain?block=${proof.block}`} className="text-teal font-medium underline">#{proof.block}</Link>],
-    ['Nodes that agree', consensus ? `${consensus.agree} of ${consensus.total}` : null],
-    ['Block links checked', walk ? `${walk.blocksChecked} (#${walk.from} to #${walk.to}): ${walk.valid ? 'all valid' : `broken at #${walk.brokenAt}`}` : null],
-    ['Issuer signature', walk ? (walk.issuerSignatureValid ? 'valid' : 'FAILED') : null],
-    ['Validator signatures on the block', walk ? (walk.validatorSignaturesValid ? `valid (${proof.validatorSignatures})` : 'FAILED') : null],
+    ['Network', proof.network ? `Ethereum ${proof.network}` : null],
+    ['Smart contract', proof.contract ? <span key="c" className="font-mono">{shortenHash(proof.contract)}</span> : null],
+    ['Recorded in block', proof.blockNumber != null ? `#${Number(proof.blockNumber).toLocaleString()}` : null],
+    ['Confirmations (blocks since)', proof.confirmations != null ? Number(proof.confirmations).toLocaleString() : null],
+    ['Block hash', proof.blockHash ? <span key="h" className="font-mono">{shortenHash(proof.blockHash)}</span> : null],
+    [
+      'Transaction',
+      proof.txHash ? (
+        tx ? <a key="t" href={tx} target="_blank" rel="noreferrer" className="font-mono text-teal underline">{shortenHash(proof.txHash)}</a> : <span key="t" className="font-mono">{shortenHash(proof.txHash)}</span>
+      ) : null,
+    ],
+    ['Recorded as', proof.mode === 'merkle-batch' ? `Merkle batch #${proof.batchId}` : 'individual credential'],
+    ['Merkle proof', proof.mode === 'merkle-batch' ? (proof.merkleProofValid ? `valid (${proof.merkleProof.length} hashes to the root)` : 'FAILED') : null],
     ['Issued by', issuer ? issuer.name : null],
     ['Issuer address', issuer ? <span key="a" className="font-mono">{shortenHash(issuer.address)}</span> : null],
-    ['Transaction', <span key="t" className="font-mono">{shortenHash(proof.txId)}</span>],
-    ['Block hash', <span key="h" className="font-mono">{shortenHash(proof.blockHash)}</span>],
-    ['Merkle proof', proof.merkleProofValid ? `valid (${proof.merkleProof.length} hashes)` : 'FAILED'],
-    ['Recomputed hash = chain hash', hash ? (hash.match ? 'yes' : 'NO') : 'not reached'],
-    ['Semester marks hash = chain hash', hash?.marksMatch == null ? null : hash.marksMatch ? 'yes' : 'NO'],
+    ['Recomputed hash = contract docHash', hash ? (hash.match ? 'yes' : 'NO') : 'not reached'],
   ].filter(([, v]) => v != null);
   return (
     <details className="border-t border-border pt-3 mt-4 group">

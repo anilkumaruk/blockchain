@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import sharp from 'sharp';
 import jsQR from 'jsqr';
 import { createWorker } from 'tesseract.js';
-import { buildDatasetLedger } from './lib/dataset-ledger.js';
+import { buildDatasetChain, loadData } from './lib/dataset-chain.js';
 import { verifyCertificateEvidence } from '../server/photoVerify.js';
 import { certificateSvg } from '../../src/lib/certificateSvg.js';
 import { viewFromDegree } from '../../src/lib/certificateView.js';
@@ -20,9 +20,15 @@ const PER_CASE = Number(process.env.BENCH_PER_CASE || 8);
 const SAMPLES = path.join(root, '..', 'public', 'samples');
 fs.mkdirSync(SAMPLES, { recursive: true });
 
-const { deps, certs, semesters, enrollments, authority } = await buildDatasetLedger(console.log);
+const { deps, certs, semesters, enrollments, records } = await buildDatasetChain(console.log);
+// What the marks card prints about the chain: the document hash in the contract and its status there.
+const chainCard = async (d) => {
+  const degree = records.get(certNo(d).toLowerCase());
+  const onChain = await deps.onChain({ degree });
+  return { hash: degree.record.hash.slice(2), txId: null, block: degree.record.blockNumber, status: onChain.status, marksVerified: true };
+};
 const ORIGIN = 'https://blockchain-ecru-three.vercel.app';
-const universityOf = new Map((await import('./lib/dataset-ledger.js')).loadData('universities').map((u) => [u.univ_id, u.univ_name]));
+const universityOf = new Map(loadData('universities').map((u) => [u.univ_id, u.univ_name]));
 const viewOf = (d) => {
   const view = viewFromDegree({ ...d, university: universityOf.get(d.univ_id) });
   const e = enrollments.get(d.enrollment_id);
@@ -76,21 +82,7 @@ const CONDITIONS = {
   },
 };
 
-// Demo images for the website's sample buttons: a slight tilt and blur, no speckle.
-async function writeSamples() {
-  for (const c of CASES.filter((x) => x.sample)) {
-    const d = c.docs[0];
-    const onChain = await authority.getById(certNo(d));
-    const svg = certificateSvg(
-      { view: c.alter(viewOf(d)), hash: d.sha256_hash, txId: onChain.txId, status: onChain.status, marksVerified: true },
-      { origin: ORIGIN, includeQr: !c.noQr }
-    );
-    const out = await sharp(Buffer.from(svg)).flatten({ background: '#fff' }).rotate(-1, { background: '#d8d4cc' }).blur(0.4).modulate({ brightness: 0.96 }).jpeg({ quality: 82 }).toBuffer();
-    fs.writeFileSync(path.join(SAMPLES, `${c.sample}.jpg`), out);
-  }
-}
-await writeSamples();
-if (process.env.SAMPLES_ONLY === '1') process.exit(0);
+
 
 const worker = await createWorker('eng', 1, { langPath: path.join(root, '..', 'public', 'tesseract'), cacheMethod: 'none', logger: () => {} });
 await worker.setParameters({ preserve_interword_spaces: '1' });
@@ -114,6 +106,30 @@ async function read(buffer) {
   return { ocrText: text, qrText: qr?.data ?? '' };
 }
 
+// Demo images for the website's sample buttons: a good photo (slight tilt, no
+// blur or speckle). Each is checked with the same OCR steps as the website; a
+// card whose rows this OCR misreads is skipped for the next one, and the number
+// of skipped cards is printed. The benchmark below measures every card.
+async function writeSamples() {
+  for (const c of CASES.filter((x) => x.sample)) {
+    const candidates = [...c.docs, ...pick(c.key === 'revoked' ? of('REVOKED') : issued, 12, 1)];
+    for (const [tries, d] of candidates.entries()) {
+      const svg = certificateSvg({ view: c.alter(viewOf(d)), ...(await chainCard(d)) }, { origin: ORIGIN, includeQr: !c.noQr });
+      const out = await sharp(Buffer.from(svg)).flatten({ background: '#fff' }).rotate(-0.5, { background: '#d8d4cc' }).modulate({ brightness: 0.96 }).jpeg({ quality: 82 }).toBuffer();
+      const verdict = (await verifyCertificateEvidence(await read(out), deps)).verdict;
+      if (verdict !== c.want) continue;
+      fs.writeFileSync(path.join(SAMPLES, `${c.sample}.jpg`), out);
+      console.log(`  sample ${c.sample}: ${certNo(d)} (${tries} card(s) skipped)`);
+      break;
+    }
+  }
+}
+await writeSamples();
+if (process.env.SAMPLES_ONLY === '1') {
+  await worker.terminate();
+  process.exit(0);
+}
+
 const results = {};
 const wrong = [];
 let imageNo = 0;
@@ -123,9 +139,8 @@ for (const [cond, degrade] of Object.entries(CONDITIONS)) {
     const row = (results[cond][c.key] = { want: c.want, total: 0, correct: 0, qrRead: 0, ms: 0 });
     for (const d of c.docs) {
       const genuine = viewOf(d);
-      const onChain = await authority.getById(certNo(d));
       const svg = certificateSvg(
-        { view: c.alter(genuine), hash: d.sha256_hash, txId: onChain.txId, status: onChain.status, marksVerified: true },
+        { view: c.alter(genuine), ...(await chainCard(d)) },
         { origin: ORIGIN, includeQr: !c.noQr }
       );
       const img = await degrade(sharp(Buffer.from(svg)).flatten({ background: '#fff' }), imageNo++);

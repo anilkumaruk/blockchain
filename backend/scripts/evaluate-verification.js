@@ -1,11 +1,12 @@
 // Runs the dataset's 666 labelled verification requests through the real
-// verifier and the real blockchain code (in memory), and reports accuracy.
+// verifier against the real CredentialRegistry contract (Hardhat's in-process
+// Ethereum, built from the dataset exactly as the import does), and reports accuracy.
 //   npm run chain:evaluate
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildDatasetLedger } from './lib/dataset-ledger.js';
+import { buildDatasetChain } from './lib/dataset-chain.js';
 import { verifyCertificateEvidence } from '../server/photoVerify.js';
 import { qrPayload } from '../../src/lib/certificateView.js';
 
@@ -13,7 +14,15 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const load = (n) => JSON.parse(fs.readFileSync(path.join(here, '..', 'data', 'karnataka', `${n}.json`), 'utf8'));
 const requests = load('verification_requests');
 
-const { summary, deps } = await buildDatasetLedger((m) => console.log(m));
+const { summary, deps, records } = await buildDatasetChain((m) => console.log(m));
+
+// The dataset's QR codes carry its own SHA-256 of the canonical line. A QR that
+// matches it is the genuine QR, which in this system carries the document hash
+// recorded in the contract; any other QR hash stays a forgery.
+const qrHashFor = (r) => {
+  const d = records.get(String(r.claimed_certificate_no ?? '').toLowerCase());
+  return d && r.qr_hash_on_document === d.sha256_hash ? d.record.hash.slice(2) : r.qr_hash_on_document;
+};
 
 // A request is what someone claims a certificate says, written as its printed rows.
 const asText = (r) =>
@@ -42,7 +51,7 @@ const byReason = new Map();
 const failures = [];
 const started = Date.now();
 for (const r of requests) {
-  const qrText = r.qr_hash_on_document && r.claimed_certificate_no ? qrPayload(r.claimed_certificate_no, r.qr_hash_on_document) : '';
+  const qrText = r.qr_hash_on_document && r.claimed_certificate_no ? qrPayload(r.claimed_certificate_no, qrHashFor(r)) : '';
   const out = await verifyCertificateEvidence({ ocrText: asText(r), qrText }, deps);
   const want = expectedVerdict(r);
   matrix[want][out.verdict] += 1;
@@ -60,8 +69,8 @@ const lines = [
   '# Verification evaluation: 666 labelled requests',
   '',
   `Generated ${new Date().toISOString()} by \`npm run chain:evaluate\`.`,
-  `Chain used: ${summary.blocks} blocks, ${summary.transactions} transactions, ${summary.certificates} certificates.`,
-  'Input: each request\'s claimed details as text, and its QR hash. These cases test the verifier and the chain; OCR is measured separately in photo-ocr.md.',
+  `Contract used: CredentialRegistry on Hardhat's in-process Ethereum, ${summary.batchCount} Merkle batches (one per university), ${summary.totalIssued} certificates, ${summary.totalRevoked} revoked.`,
+  'Input: each request\'s claimed details as text, and its QR hash (a QR matching the dataset\'s own hash is treated as the genuine QR). These cases test the verifier and the contract; OCR is measured separately in photo-ocr.md.',
   '',
   `**Accuracy: ${correct}/${requests.length} (${((correct / requests.length) * 100).toFixed(2)}%)**, ${ms.toFixed(2)} ms per verification.`,
   '',

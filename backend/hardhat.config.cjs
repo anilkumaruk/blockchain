@@ -12,6 +12,8 @@ module.exports = {
     settings: { optimizer: { enabled: true, runs: 200 } },
   },
   networks: {
+    // Stay under the node's per-transaction gas cap (16,777,216).
+    hardhat: { blockGasLimit: 16_000_000 },
     localhost: { url: 'http://127.0.0.1:8545' },
     ...(SEPOLIA_RPC_URL && DEPLOYER_PRIVATE_KEY
       ? { sepolia: { url: SEPOLIA_RPC_URL, accounts: [DEPLOYER_PRIVATE_KEY] } }
