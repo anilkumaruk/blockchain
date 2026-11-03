@@ -1,19 +1,22 @@
 // Deploys CredentialRegistry and writes deployments/<network>.json, which
-// the API server reads to find the contract address and ABI.
+// the API server and the website read to find the contract address and ABI.
+// The deployer becomes the contract owner (the platform, which authorises
+// universities). It is then removed as an issuer: only universities issue.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import hre from 'hardhat';
 
-const institution = process.env.INSTITUTION_NAME || 'Alliance University';
+const platform = process.env.PLATFORM_NAME || 'Chain of Record platform';
 
 const [deployer] = await hre.ethers.getSigners();
 console.log(`Deploying CredentialRegistry to "${hre.network.name}" from ${deployer.address}...`);
 
-const registry = await hre.ethers.deployContract('CredentialRegistry', [institution]);
+const registry = await hre.ethers.deployContract('CredentialRegistry', [platform]);
 await registry.waitForDeployment();
 const address = await registry.getAddress();
 const receipt = await registry.deploymentTransaction().wait();
+await (await registry.setIssuer(deployer.address, platform, false)).wait();
 
 const artifact = await hre.artifacts.readArtifact('CredentialRegistry');
 const outDir = path.join(hre.config.paths.root, 'deployments');
@@ -26,7 +29,7 @@ fs.writeFileSync(
       chainId: Number((await hre.ethers.provider.getNetwork()).chainId),
       address,
       owner: deployer.address,
-      institution,
+      platform,
       deployTx: receipt.hash,
       blockNumber: receipt.blockNumber,
       abi: artifact.abi,

@@ -5,9 +5,9 @@ import { expect } from 'chai';
 import hre from 'hardhat';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
-import { buildApp, login, seededStore } from './helpers.js';
+import { buildApp, deployRegistry, login, seededStore, signers, university } from './helpers.js';
 import { hashPassword, verifyPassword } from '../server/passwords.js';
-import { databaseSslFromEnv, loadConfig, HARDHAT_DEV_KEY } from '../server/config.js';
+import { databaseSslFromEnv, loadConfig } from '../server/config.js';
 
 const { ethers } = hre;
 const STUDENT = {
@@ -18,10 +18,11 @@ const STUDENT = {
 };
 
 describe('Security', () => {
-  let registry, app, token;
+  let registry, app, token, owner, registrar;
 
   beforeEach(async () => {
-    registry = await ethers.deployContract('CredentialRegistry', ['Alliance University']);
+    [owner, registrar] = await signers();
+    registry = await deployRegistry();
     app = await buildApp(registry);
     token = await login(app, 'registrar.admin', 'admin12345');
   });
@@ -71,7 +72,7 @@ describe('Security', () => {
     });
 
     const tryToken = (t) =>
-      request(app).post('/api/credentials').set('Authorization', `Bearer ${t}`).send(STUDENT);
+      request(app).post('/api/credentials/prepare').set('Authorization', `Bearer ${t}`).send(STUDENT);
 
     it('rejects unsigned (alg=none), wrongly-signed and expired tokens', async () => {
       const claims = { role: 'admin', sub: 'registrar.admin', iss: 'chain-of-record', aud: 'chain-of-record-api' };
@@ -100,6 +101,7 @@ describe('Security', () => {
         ['get', '/api/admin/audit'],
         ['post', '/api/admin/pause'],
         ['post', '/api/credentials/batch'],
+        ['post', '/api/credentials/prepare'],
       ]) {
         const res = await request(app)[method](path).set('Authorization', `Bearer ${studentToken}`).send({});
         expect(res.status, `${method} ${path}`).to.equal(403);
@@ -133,21 +135,19 @@ describe('Security', () => {
         { ...STUDENT, studentName: 'x'.repeat(201) },
         { ...STUDENT, issueDate: '2026-13-45' },
         { ...STUDENT, credentialId: "COR'; DROP TABLE credentials;--" },
-        { ...STUDENT, txHash: 'not-a-hash' },
       ];
       for (const body of cases) {
-        expect((await request(app).post('/api/credentials').set(auth).send(body)).status).to.equal(400);
+        expect((await request(app).post('/api/credentials/prepare').set(auth).send(body)).status).to.equal(400);
       }
+      const badTx = await request(app).post('/api/credentials').set(auth).send({ ...STUDENT, credentialId: 'COR-2026-AAAAAA', txHash: 'not-a-hash' });
+      expect(badTx.status).to.equal(409); // nothing on chain for it, so nothing is recorded
       const malformed = await request(app)
         .post('/api/credentials')
         .set(auth)
         .set('Content-Type', 'application/json')
         .send('{"broken":');
       expect(malformed.status).to.equal(400);
-      const huge = await request(app)
-        .post('/api/verify/file')
-        .set('Content-Type', 'application/pdf')
-        .send(Buffer.alloc(6 * 1024 * 1024, 0x25));
+      const huge = await request(app).post('/api/verify/photo').send({ ocrText: 'x'.repeat(100 * 1024) });
       expect(huge.status).to.equal(413);
     });
 
@@ -164,11 +164,9 @@ describe('Security', () => {
       const audited = await buildApp(registry, { store });
       await request(audited).post('/api/auth/login').send({ username: 'registrar.admin', password: 'bad' });
       const t = await login(audited, 'registrar.admin', 'admin12345');
-      const issued = await request(audited).post('/api/credentials').set('Authorization', `Bearer ${t}`).send(STUDENT);
-      await request(audited)
-        .post(`/api/credentials/${issued.body.credentialId}/revoke`)
-        .set('Authorization', `Bearer ${t}`)
-        .send({ reason: 'test' });
+      const uni = university(audited, t, registrar, registry);
+      const issued = await uni.issue(STUDENT);
+      await uni.revoke(issued.body.credentialId, 'test');
 
       // Only the platform admin can read the audit log; registrars can't.
       expect((await request(audited).get('/api/admin/audit').set('Authorization', `Bearer ${t}`)).status).to.equal(403);
@@ -194,29 +192,25 @@ describe('Security', () => {
     it('blocks issuance while paused but keeps verification working', async () => {
       const auth = { Authorization: `Bearer ${token}` };
       const platform = { Authorization: `Bearer ${await login(app, 'platform.admin', 'platform12345')}` };
-      const issued = await request(app).post('/api/credentials').set(auth).send(STUDENT);
+      const uni = university(app, token, registrar, registry);
+      const issued = await uni.issue(STUDENT);
 
       expect((await request(app).post('/api/admin/pause').set(auth).send({ paused: true })).status).to.equal(403);
-      const pause = await request(app).post('/api/admin/pause').set(platform).send({ paused: true });
-      expect(pause.status).to.equal(200);
+      // The API only records what the contract says: the owner signs pause() first.
+      expect((await request(app).post('/api/admin/pause').set(platform).send({ paused: true })).status).to.equal(409);
+      await (await registry.connect(owner).pause()).wait();
+      expect((await request(app).post('/api/admin/pause').set(platform).send({ paused: true })).body.paused).to.equal(true);
       expect((await request(app).get('/api/health')).body.paused).to.equal(true);
 
-      const blocked = await request(app)
-        .post('/api/credentials')
-        .set(auth)
-        .send({ ...STUDENT, studentName: 'Another Student' });
-      expect(blocked.status).to.equal(423);
-      expect(blocked.body.code).to.equal('EnforcedPause');
+      const prep = (await request(app).post('/api/credentials/prepare').set(auth).send({ ...STUDENT, studentName: 'Another Student' })).body;
+      await expect(registry.connect(registrar).issueCredential(prep.credentialId, prep.docHash)).to.be.revertedWithCustomError(
+        registry,
+        'EnforcedPause'
+      );
+      expect((await request(app).get(`/api/verify/${issued.body.credentialId}`)).body.status).to.equal('valid');
 
-      const verify = await request(app).get(`/api/verify/${issued.body.credentialId}`);
-      expect(verify.body.status).to.equal('valid');
-
-      await request(app).post('/api/admin/pause').set(platform).send({ paused: false });
-      const resumed = await request(app)
-        .post('/api/credentials')
-        .set(auth)
-        .send({ ...STUDENT, studentName: 'Another Student' });
-      expect(resumed.status).to.equal(201);
+      await (await registry.connect(owner).unpause()).wait();
+      expect((await uni.issue({ ...STUDENT, studentName: 'Another Student' })).status).to.equal(201);
     });
   });
 
@@ -243,10 +237,8 @@ describe('Security', () => {
       NODE_ENV: 'production',
       DATABASE_URL: 'postgres://x',
       JWT_SECRET: 'a'.repeat(48),
-      ISSUER_PRIVATE_KEY: '0x' + '11'.repeat(32),
       CORS_ORIGIN: 'https://blockchain-ecru-three.vercel.app',
       CHAIN_NETWORK: 'sepolia',
-      WALLET_ENCRYPTION_KEY: 'ab'.repeat(32),
     };
 
     it('accepts a complete production configuration', () => {
@@ -258,9 +250,8 @@ describe('Security', () => {
         'weak JWT secret': { JWT_SECRET: 'short' },
         'no database': { DATABASE_URL: '' },
         'memory store': { USE_MEMORY_STORE: 'true' },
-        'dev key': { ISSUER_PRIVATE_KEY: HARDHAT_DEV_KEY },
         'open CORS': { CORS_ORIGIN: '' },
-        'no wallet encryption key': { WALLET_ENCRYPTION_KEY: '' },
+        'unknown network': { CHAIN_NETWORK: 'mainnet' },
       };
       for (const [name, override] of Object.entries(cases)) {
         expect(loadConfig({ ...prod, ...override }).errors, name).to.not.be.empty;
@@ -282,13 +273,10 @@ describe('Security', () => {
       expect(databaseSslFromEnv({ DATABASE_URL: 'postgres://chain:chain@localhost:5544/db' }).ssl).to.equal(undefined);
     });
 
-    it('never uses the dev key on a public network, even outside production', () => {
-      const { errors } = loadConfig({
-        CHAIN_NETWORK: 'sepolia',
-        DATABASE_URL: 'postgres://x',
-        ISSUER_PRIVATE_KEY: HARDHAT_DEV_KEY,
-      });
-      expect(errors.join(' ')).to.match(/public network/);
+    it('holds no private keys: a leftover key setting is flagged, never used', () => {
+      const { config, warnings } = loadConfig({ ...prod, ISSUER_PRIVATE_KEY: '0x' + '11'.repeat(32) });
+      expect(JSON.stringify(config)).to.not.include('11'.repeat(32));
+      expect(warnings.join(' ')).to.match(/ISSUER_PRIVATE_KEY is set but no longer used/);
     });
   });
 });

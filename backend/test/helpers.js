@@ -1,13 +1,13 @@
-// Shared test setup: an API instance backed by an in-memory store with two
-// accounts, talking to whatever registry contract the test deployed.
+// Shared test setup: a CredentialRegistry on Hardhat's in-process Ethereum, an
+// API backed by an in-memory store, and helpers that sign transactions the way
+// MetaMask would in the browser (prepare on the server, sign, then confirm).
 
-import crypto from 'node:crypto';
 import hre from 'hardhat';
 import request from 'supertest';
 import { createChainBridge } from '../server/chain.js';
 import { createMemoryStore } from '../server/store.js';
 import { createAuth } from '../server/auth.js';
-import { createApp } from '../server/app.js';
+import { createApp, normalizeReason } from '../server/app.js';
 import { hashPassword } from '../server/passwords.js';
 
 // supertest starts each app with listen(0) on every interface, then connects to
@@ -38,41 +38,37 @@ const ADMIN_HASH = await hashPassword('admin12345');
 const STUDENT_HASH = await hashPassword('student12345');
 const PLATFORM_HASH = await hashPassword('platform12345');
 
+/** Hardhat accounts: 0 owns the contract (platform), 1 is Alliance University's MetaMask. */
+export const signers = () => hre.ethers.getSigners();
+
+/** A fresh registry: the platform owns it, Alliance University may issue. */
+export async function deployRegistry() {
+  const [owner, university] = await signers();
+  const registry = await hre.ethers.deployContract('CredentialRegistry', ['Chain of Record platform']);
+  await registry.setIssuer(owner.address, 'Chain of Record platform', false);
+  await registry.setIssuer(university.address, 'Alliance University', true);
+  return registry;
+}
+
 export async function seededStore() {
+  const [, university] = await signers();
   const store = createMemoryStore();
-  // The root institution exists, as it does in a deployed database; its wallet
-  // address is filled in from the contract owner on first use.
-  await store.createInstitution({ id: 'alliance-university', name: 'Alliance University', status: 'approved' });
-  // Alliance University's registrar is an ordinary university account...
-  await store.createUser({
-    username: 'registrar.admin',
-    passwordHash: ADMIN_HASH,
-    role: 'institution',
-    institutionId: 'alliance-university',
-  });
-  // ...and the platform admin (institution approvals, registry, audit) is separate.
+  await store.createInstitution({ id: 'alliance-university', name: 'Alliance University', status: 'approved', walletAddress: university.address });
+  await store.createUser({ username: 'registrar.admin', passwordHash: ADMIN_HASH, role: 'institution', institutionId: 'alliance-university' });
+  // The platform admin (institution approvals, registry, audit) belongs to no university.
   await store.createUser({ username: 'platform.admin', passwordHash: PLATFORM_HASH, role: 'admin' });
-  await store.createUser({
-    username: 'ananya',
-    passwordHash: STUDENT_HASH,
-    role: 'student',
-    studentId: 'RGIT21CS014',
-  });
+  await store.createUser({ username: 'ananya', passwordHash: STUDENT_HASH, role: 'student', studentId: 'RGIT21CS014' });
   return store;
 }
 
-export const TEST_WALLET_KEY = crypto.createHash('sha256').update('test-wallet-key').digest();
-
-export async function buildApp(contract, { store, rateLimits = false, ...options } = {}) {
+export async function buildApp(contract, { store, rateLimits = false, ipfs = null, ...options } = {}) {
   store ??= await seededStore();
   return createApp({
     chain: createChainBridge(contract, options),
-    connect: (privateKey) =>
-      createChainBridge(contract.connect(new hre.ethers.Wallet(privateKey, hre.ethers.provider)), options),
-    walletKey: TEST_WALLET_KEY,
     store,
     auth: createAuth({ jwtSecret: 'test-secret', store }),
-    institutionName: 'Alliance University',
+    ipfs,
+    network: { name: 'hardhat', chainId: 31337 },
     rateLimits,
   });
 }
@@ -80,4 +76,42 @@ export async function buildApp(contract, { store, rateLimits = false, ...options
 export async function login(app, username, password) {
   const res = await request(app).post('/api/auth/login').send({ username, password });
   return res.body.token;
+}
+
+/**
+ * A university at work: every write is prepared by the API, signed by `signer`
+ * (standing in for the registrar's MetaMask), then confirmed by the API.
+ */
+export function university(app, token, signer, registry) {
+  const auth = { Authorization: `Bearer ${token}` };
+  const asSigner = registry.connect(signer);
+  return {
+    auth,
+    async issue(body) {
+      const prep = await request(app).post('/api/credentials/prepare').set(auth).send(body);
+      if (prep.status !== 200) return prep;
+      const tx = await (await asSigner.issueCredential(prep.body.credentialId, prep.body.docHash)).wait();
+      return request(app)
+        .post('/api/credentials')
+        .set(auth)
+        .send({ ...prep.body.fields, studentEmail: body.studentEmail, replaces: body.replaces, txHash: tx.hash });
+    },
+    async revoke(credentialId, reason) {
+      const record = (await request(app).get(`/api/credentials/${credentialId}`)).body;
+      const reasonHash = hre.ethers.keccak256(hre.ethers.toUtf8Bytes(normalizeReason(reason)));
+      await (
+        record.batch
+          ? await asSigner.revokeBatchCredential(record.batch.batchId, credentialId, record.hash, record.batch.proof, reasonHash)
+          : await asSigner.revokeCredential(credentialId, reasonHash)
+      ).wait();
+      return request(app).post(`/api/credentials/${credentialId}/revoke`).set(auth).send({ reason });
+    },
+    async batch(credentials) {
+      const prep = await request(app).post('/api/credentials/batch/prepare').set(auth).send({ credentials });
+      if (prep.status !== 200) return prep;
+      const tx = await (await asSigner.anchorBatch(prep.body.root, prep.body.count)).wait();
+      const batchId = Number(tx.logs.map((l) => registry.interface.parseLog(l)).find((e) => e?.name === 'BatchAnchored').args.batchId);
+      return request(app).post('/api/credentials/batch').set(auth).send({ credentials: prep.body.credentials, batchId, txHash: tx.hash });
+    },
+  };
 }

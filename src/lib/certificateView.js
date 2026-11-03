@@ -75,11 +75,27 @@ export const marksString = (rows) =>
     .map((r) => [r.semester, r.credits_earned, Number(r.sgpa).toFixed(2), r.result, r.backlogs].join('|'))
     .join('\n');
 
+/**
+ * The document whose SHA-256 is recorded in the smart contract (docHash): the
+ * certificate's canonical line plus every semester row. Changing any printed
+ * detail or any mark changes the hash.
+ */
+export const documentString = (canonical, semesters = []) => `${canonical}\n${marksString(semesters)}`;
+
+/** On-chain credential ID for a certificate number ("/" is not used on chain). */
+export const chainIdOf = (certificateNo) => String(certificateNo).replace(/\//g, '-');
+
 export const qrPayload = (certificateNo, hash) => `COR1|${certificateNo}|${hash}`;
 
-/** The QR holds a link any phone can open, carrying the number and fingerprint. */
-export const verifyUrl = (origin, certificateNo, hash) =>
-  `${origin}/verify?credentialId=${encodeURIComponent(certificateNo)}&h=${hash}`;
+/**
+ * The QR holds a link any phone can open, carrying the number and fingerprint.
+ * With `ipfs` ({ cid, key }) the link also lets the verifier fetch and decrypt
+ * the certificate from IPFS. They sit after "#", which browsers never send to a
+ * server, so only whoever holds the QR can read the document.
+ */
+export const verifyUrl = (origin, certificateNo, hash, ipfs = null) =>
+  `${origin}/verify?credentialId=${encodeURIComponent(certificateNo)}&h=${hash}` +
+  (ipfs?.cid && ipfs?.key ? `#cid=${ipfs.cid}&k=${ipfs.key}` : '');
 
 export function parseQrPayload(text) {
   const raw = String(text ?? '').trim();
@@ -89,7 +105,13 @@ export function parseQrPayload(text) {
     const url = new URL(raw);
     const certificateNo = url.searchParams.get('credentialId');
     const hash = url.searchParams.get('h');
-    if (certificateNo && /^[0-9a-f]{64}$/i.test(hash ?? '')) return { certificateNo, hash: hash.toLowerCase() };
+    if (certificateNo && /^[0-9a-f]{64}$/i.test(hash ?? '')) {
+      const fragment = new URLSearchParams(url.hash.slice(1));
+      const cid = fragment.get('cid');
+      const key = fragment.get('k');
+      const ipfs = cid && /^[0-9a-f]{64}$/i.test(key ?? '') ? { cid, key: key.toLowerCase() } : null;
+      return { certificateNo, hash: hash.toLowerCase(), ...(ipfs ? { ipfs } : {}) };
+    }
   } catch {
     // not a link
   }

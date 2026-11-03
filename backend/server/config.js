@@ -1,10 +1,8 @@
 // Reads and validates environment configuration. In production the server
 // refuses to start with unsafe settings instead of silently falling back.
 
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseEther } from 'ethers';
 
 // Hardhat's publicly known account #0 key. Fine on a local dev chain, a
 // guaranteed loss of funds anywhere else.
@@ -64,31 +62,23 @@ export function loadConfig(env = process.env) {
   const config = {
     production,
     port: Number(env.PORT || 4000),
+    // Which deployments/<network>.json the contract address comes from.
     network,
-    // On Sepolia prefer SEPOLIA_RPC_URL, so a local RPC_URL in .env can't leak into a testnet run.
+    // Read-only access to the contract. On Sepolia prefer SEPOLIA_RPC_URL, so a
+    // local RPC_URL in .env can't leak into a testnet run.
     rpcUrl: (network === 'sepolia' && env.SEPOLIA_RPC_URL) || env.RPC_URL || 'http://127.0.0.1:8545',
-    contractAddress: env.CONTRACT_ADDRESS || null,
-    // On a public network the deployer (contract owner) is the platform's issuer by default.
-    issuerKey:
-      env.ISSUER_PRIVATE_KEY || (network === 'localhost' ? HARDHAT_DEV_KEY : env.DEPLOYER_PRIVATE_KEY || null),
-    trustedIssuer: env.TRUSTED_ISSUER_ADDRESS || undefined,
     databaseUrl: env.DATABASE_URL || null,
     useMemoryStore: env.USE_MEMORY_STORE === 'true',
     jwtSecret: env.JWT_SECRET || (production ? null : DEV_JWT_SECRET),
     tokenTtl: env.JWT_TTL || '1h',
     corsOrigin: env.CORS_ORIGIN ? env.CORS_ORIGIN.split(',').map((s) => s.trim()) : production ? null : true,
     trustProxy: env.TRUST_PROXY ? Number(env.TRUST_PROXY) || env.TRUST_PROXY : false,
-    institutionName: env.INSTITUTION_NAME || 'Alliance University',
-    // 32-byte key (64 hex chars) that encrypts each institution's issuer wallet.
-    walletKey: /^[0-9a-f]{64}$/i.test(env.WALLET_ENCRYPTION_KEY ?? '')
-      ? Buffer.from(env.WALLET_ENCRYPTION_KEY, 'hex')
-      : production
-        ? null
-        : crypto.createHash('sha256').update('chain-of-record-dev-wallet-key').digest(),
-    // ETH sent to a newly approved institution so it can pay gas.
-    fundingWei: parseEther(env.INSTITUTION_FUNDING_ETH || (network === 'localhost' ? '1' : '0.02')),
+    // Pinata JWT for IPFS. Unset: certificates are not copied to IPFS, and
+    // verification works from the smart contract alone.
+    pinataJwt: env.PINATA_JWT || null,
+    ipfsGateway: env.IPFS_GATEWAY || undefined,
     bootstrapAdmin: {
-      username: env.ADMIN_USERNAME || 'registrar.admin',
+      username: env.ADMIN_USERNAME || 'platform.admin',
       password: env.ADMIN_PASSWORD || (production ? null : 'admin12345'),
     },
   };
@@ -106,26 +96,21 @@ export function loadConfig(env = process.env) {
     errors.push('DATABASE_URL is required (or set USE_MEMORY_STORE=true for a throwaway demo).');
   }
   if (config.useMemoryStore) warnings.push('USE_MEMORY_STORE=true: data is lost when the server stops.');
-  if (env.WALLET_ENCRYPTION_KEY && !/^[0-9a-f]{64}$/i.test(env.WALLET_ENCRYPTION_KEY)) {
-    errors.push('WALLET_ENCRYPTION_KEY must be 64 hex characters (openssl rand -hex 32).');
-  } else if (!env.WALLET_ENCRYPTION_KEY) {
-    if (production) errors.push('WALLET_ENCRYPTION_KEY is required in production (openssl rand -hex 32).');
-    else warnings.push('Using the built-in dev WALLET_ENCRYPTION_KEY; institution wallet keys are not safely encrypted.');
+  if (!['localhost', 'sepolia'].includes(network)) errors.push('CHAIN_NETWORK must be localhost or sepolia.');
+  // Every transaction is signed in MetaMask; a key here would only be a liability.
+  for (const name of ['ISSUER_PRIVATE_KEY', 'WALLET_ENCRYPTION_KEY']) {
+    if (env[name]) warnings.push(`${name} is set but no longer used: the server holds no keys. Remove it.`);
   }
-  if (!config.issuerKey) errors.push(`ISSUER_PRIVATE_KEY is required for network "${network}".`);
+  if (!config.pinataJwt) warnings.push('PINATA_JWT is not set: certificates are not copied to IPFS.');
 
   if (production) {
     if (config.useMemoryStore) errors.push('USE_MEMORY_STORE is not allowed in production.');
     if (!config.jwtSecret || config.jwtSecret.length < 32) {
       errors.push('JWT_SECRET must be set to at least 32 random characters in production.');
     }
-    if (config.issuerKey === HARDHAT_DEV_KEY) errors.push('The Hardhat dev key must never be used in production.');
     if (!config.corsOrigin) errors.push('CORS_ORIGIN must list the allowed frontend origin(s) in production.');
-  } else {
-    if (config.jwtSecret === DEV_JWT_SECRET) warnings.push('Using the built-in dev JWT secret.');
-  }
-  if (network !== 'localhost' && config.issuerKey === HARDHAT_DEV_KEY) {
-    errors.push('The Hardhat dev key cannot be used on a public network.');
+  } else if (config.jwtSecret === DEV_JWT_SECRET) {
+    warnings.push('Using the built-in dev JWT secret.');
   }
 
   return { config, errors, warnings };

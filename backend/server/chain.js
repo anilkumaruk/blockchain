@@ -218,6 +218,42 @@ export function createChainBridge(contract, { timeoutMs = 8000, writeTimeoutMs =
       });
     },
 
+    /** Is this address an authorised issuer, and under which name? */
+    async issuer(address) {
+      const r = await call(() => contract.issuers(address));
+      return { active: r.active, name: r.name };
+    },
+
+    async batchInfo(batchId) {
+      const b = await call(() => contract.batches(batchId));
+      if (/^0x0+$/.test(b.root)) return null;
+      return { root: b.root.toLowerCase(), issuer: b.issuer, anchoredAt: new Date(Number(b.anchoredAt) * 1000).toISOString(), count: Number(b.count) };
+    },
+
+    async stats() {
+      const [issued, revoked, batches] = await call(() =>
+        Promise.all([contract.totalIssued(), contract.totalRevoked(), contract.batchCount()])
+      );
+      return { totalIssued: Number(issued), totalRevoked: Number(revoked), batchCount: Number(batches) };
+    },
+
+    /** A mined transaction to this contract: its block and how many blocks were added after it. */
+    async transaction(txHash) {
+      const provider = contract.runner.provider;
+      const [receipt, latest] = await call(() => Promise.all([provider.getTransactionReceipt(txHash), provider.getBlockNumber()]));
+      if (!receipt) return null;
+      const address = (await this.address()).toLowerCase();
+      return {
+        txHash: receipt.hash,
+        blockNumber: receipt.blockNumber,
+        blockHash: receipt.blockHash,
+        from: receipt.from,
+        toContract: receipt.to?.toLowerCase() === address,
+        succeeded: receipt.status === 1,
+        confirmations: latest - receipt.blockNumber + 1,
+      };
+    },
+
     async getById(credentialId) {
       return decodeCredential(await call(() => contract.getCredential(credentialId)));
     },

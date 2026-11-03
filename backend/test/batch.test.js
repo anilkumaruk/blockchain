@@ -5,8 +5,9 @@ import { expect } from 'chai';
 import hre from 'hardhat';
 import request from 'supertest';
 import { buildMerkleTree, leafOf } from '../server/merkle.js';
-import { buildApp, login } from './helpers.js';
-import { buildCertificateBytes } from '../../src/lib/generateCertificatePdf.js';
+import { buildApp, deployRegistry, login, signers, university } from './helpers.js';
+import { documentHash } from '../server/hash.js';
+import { issuedCanonical } from '../../src/lib/certificateView.js';
 
 const { ethers } = hre;
 const reason = (s) => ethers.keccak256(ethers.toUtf8Bytes(s));
@@ -96,19 +97,21 @@ describe('Merkle batch issuance', () => {
   });
 
   describe('API', () => {
-    let registry, app, token;
+    let registry, app, uni, token;
 
     beforeEach(async () => {
-      registry = await ethers.deployContract('CredentialRegistry', ['Alliance University']);
+      const [, registrar] = await signers();
+      registry = await deployRegistry();
       app = await buildApp(registry);
       token = await login(app, 'registrar.admin', 'admin12345');
+      uni = university(app, token, registrar, registry);
     });
 
-    const issueBatch = (credentials) =>
-      request(app).post('/api/credentials/batch').set('Authorization', `Bearer ${token}`).send({ credentials });
+    const prepare = (credentials) =>
+      request(app).post('/api/credentials/batch/prepare').set('Authorization', `Bearer ${token}`).send({ credentials });
 
-    it('issues a batch in one transaction and verifies each member by ID and by file', async () => {
-      const res = await issueBatch([1, 2, 3, 4, 5].map(student));
+    it('issues a batch in one transaction and verifies each member by ID and by hash', async () => {
+      const res = await uni.batch([1, 2, 3, 4, 5].map(student));
       expect(res.status, JSON.stringify(res.body)).to.equal(201);
       expect(res.body.count).to.equal(5);
       expect(await registry.batchCount()).to.equal(1n);
@@ -117,54 +120,52 @@ describe('Merkle batch issuance', () => {
         const byId = await request(app).get(`/api/verify/${c.credentialId}`);
         expect(byId.body.status).to.equal('valid');
         expect(byId.body.details.onChain.batchId).to.equal(1);
-
-        const record = (await request(app).get(`/api/credentials/${c.credentialId}`)).body;
-        const pdf = Buffer.from(buildCertificateBytes(record));
-        const byFile = await request(app).post('/api/verify/file').set('Content-Type', 'application/pdf').send(pdf);
-        expect(byFile.body.status).to.equal('valid');
+        const byHash = await request(app).post('/api/verify/hash').send({ hash: c.hash });
+        expect(byHash.body.status).to.equal('valid');
       }
     });
 
     it('detects a tampered batch certificate', async () => {
-      const res = await issueBatch([1, 2, 3].map(student));
+      const res = await uni.batch([1, 2, 3].map(student));
       const record = (await request(app).get(`/api/credentials/${res.body.credentials[0].credentialId}`)).body;
-      const forged = Buffer.from(buildCertificateBytes({ ...record, studentName: 'Someone Else' }));
-      const verdict = await request(app).post('/api/verify/file').set('Content-Type', 'application/pdf').send(forged);
+      const forged = documentHash(issuedCanonical({ ...record, studentName: 'Someone Else' }));
+      const verdict = await request(app).post('/api/verify/hash').send({ hash: forged });
       expect(verdict.body.status).to.equal('invalid');
     });
 
+    it('refuses to record a batch whose root the contract does not hold', async () => {
+      const prep = (await prepare([1, 2].map(student))).body;
+      await (await registry.connect((await signers())[1]).anchorBatch(prep.root, prep.count)).wait();
+      const altered = prep.credentials.map((c, i) => (i === 0 ? { ...c, studentName: 'Changed' } : c));
+      const res = await request(app).post('/api/credentials/batch').set('Authorization', `Bearer ${token}`).send({ credentials: altered, batchId: 1 });
+      expect(res.status).to.equal(409);
+      expect(res.body.code).to.equal('hash_mismatch');
+    });
+
     it('revokes a batch member on-chain and shows it in the history', async () => {
-      const res = await issueBatch([1, 2, 3].map(student));
+      const res = await uni.batch([1, 2, 3].map(student));
       const id = res.body.credentials[1].credentialId;
-      const rev = await request(app)
-        .post(`/api/credentials/${id}/revoke`)
-        .set('Authorization', `Bearer ${token}`)
-        .send({ reason: 'Wrong programme' });
-      expect(rev.status).to.equal(200);
+      const rev = await uni.revoke(id, 'Wrong programme');
+      expect(rev.status, JSON.stringify(rev.body)).to.equal(200);
 
       expect((await request(app).get(`/api/verify/${id}`)).body.status).to.equal('revoked');
-      expect((await request(app).get(`/api/verify/${res.body.credentials[0].credentialId}`)).body.status).to.equal(
-        'valid'
-      );
+      expect((await request(app).get(`/api/verify/${res.body.credentials[0].credentialId}`)).body.status).to.equal('valid');
       const history = (await request(app).get(`/api/credentials/${id}/history`)).body.events;
       expect(history.map((e) => e.type)).to.deep.equal(['batch_anchored', 'revoked']);
     });
 
-    it('rejects duplicates inside a batch and IDs that already exist, before touching the chain', async () => {
-      const dup = await issueBatch([student(1), student(1)]);
-      expect(dup.status).to.equal(409);
-      await issueBatch([student(2)]);
-      const existing = await issueBatch([student(3), student(2)]);
-      expect(existing.status).to.equal(409);
+    it('rejects duplicates inside a batch and IDs that already exist, before anything is signed', async () => {
+      expect((await prepare([student(1), student(1)])).status).to.equal(409);
+      await uni.batch([student(2)]);
+      expect((await prepare([student(3), student(2)])).status).to.equal(409);
       expect(await registry.batchCount()).to.equal(1n);
     });
 
     it('validates every item and caps the batch size', async () => {
-      const bad = await issueBatch([student(1), { ...student(2), studentName: '' }]);
+      const bad = await prepare([student(1), { ...student(2), studentName: '' }]);
       expect(bad.status).to.equal(400);
       expect(bad.body.error).to.match(/^Item 1:/);
-      const tooBig = await issueBatch(Array.from({ length: 501 }, (_, i) => student(i)));
-      expect(tooBig.status).to.equal(400);
+      expect((await prepare(Array.from({ length: 501 }, (_, i) => student(i)))).status).to.equal(400);
     });
   });
 });

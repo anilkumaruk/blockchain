@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import { loadConfig } from '../backend/server/config.js';
 import { createRuntime } from '../backend/server/runtime.js';
 
-// The Solidity contract that anchors this chain's block hashes.
+// The CredentialRegistry smart contract on Ethereum Sepolia.
 const deployment = createRequire(import.meta.url)('../backend/deployments/sepolia.json');
 
 let appPromise = null;

@@ -1,24 +1,31 @@
-// REST API for Chain of Record. Response shapes intentionally mirror the
-// frontend's src/lib/mockApi.js so the React app can switch between the mock
-// and this backend without changing any page code.
+// REST API for Chain of Record.
+//
+// The blockchain is the CredentialRegistry smart contract on Ethereum. This
+// server holds no keys and never writes to the chain: universities and the
+// platform admin sign every transaction in their own MetaMask. The server
+//   - prepares what is signed (the certificate's document hash),
+//   - confirms each write by reading the contract before recording it,
+//   - verifies certificates by reading the contract,
+//   - keeps the personal data (PostgreSQL) and the encrypted documents (IPFS).
+// Response shapes mirror src/lib/mockApi.js so the pages work with either.
 
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
-import { buildCertificateBytes, computeSha256Hex } from '../../src/lib/generateCertificatePdf.js';
+import { keccak256, toUtf8Bytes } from 'ethers';
 import { ChainUnavailableError, ContractRevertError } from './chain.js';
 import { buildMerkleTree, leafOf } from './merkle.js';
 import { verifyCertificateEvidence } from './photoVerify.js';
-import { sha256 } from '../blockchain/index.js';
-import { issuedCanonical, marksString, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
+import { documentHash } from './hash.js';
+import { chainIdOf, degreeCanonical, issuedCanonical, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
 import { createInstitutionService } from './institutions.js';
 import { hashPassword } from './passwords.js';
 
 const ID_PATTERN = /^[A-Za-z0-9-]{4,40}$/;
-const CERT_REF_PATTERN = /^0x[0-9a-f]{64}$/i;
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const HASH_PATTERN = /^(0x)?[0-9a-f]{64}$/i;
+const TX_PATTERN = /^0x[0-9a-f]{64}$/i;
 const MAX_TEXT = 200;
 const EMAIL_PATTERN = /^[^\s@]{1,64}@[^\s@]{1,190}\.[^\s@]{2,}$/;
 const MAX_BATCH = 500;
@@ -47,6 +54,11 @@ class HttpError extends Error {
 const randomHex = (bytes) => Buffer.from(crypto.getRandomValues(new Uint8Array(bytes))).toString('hex');
 const today = () => new Date().toISOString().slice(0, 10);
 const asyncRoute = (fn) => (req, res, next) => fn(req, res, next).catch(next);
+const sameAddress = (a, b) => Boolean(a && b) && String(a).toLowerCase() === String(b).toLowerCase();
+const hex64 = (hash) => String(hash).toLowerCase().replace(/^0x/, '');
+
+/** The revocation reason exactly as hashed into the contract (the browser does the same). */
+export const normalizeReason = (reason) => String(reason ?? '').trim().slice(0, 500) || 'No reason provided.';
 
 function limiter(enabled, windowMs, limit) {
   if (!enabled) return (_req, _res, next) => next();
@@ -61,15 +73,11 @@ function limiter(enabled, windowMs, limit) {
 
 /**
  * @param {{
- *   chain: ReturnType<import('./chain.js').createChainBridge>,
+ *   chain: ReturnType<import('./chain.js').createChainBridge>,   // read-only contract access
  *   store: ReturnType<import('./store.js').createMemoryStore>,
  *   auth: ReturnType<import('./auth.js').createAuth>,
- *   institutionName: string,          // the platform owner (root institution)
- *   trustedIssuer?: string,
- *   connect: (privateKey: string) => ReturnType<import('./chain.js').createChainBridge>,
- *   ledger?: ReturnType<import('./ledger.js').createLedger>,   // the project's own blockchain
- *   walletKey: Buffer,                // encrypts institution wallet keys
- *   fundingWei?: bigint,              // gas money sent to newly approved institutions
+ *   ipfs?: ReturnType<import('./ipfs.js').createIpfs>,          // null: IPFS not configured
+ *   network?: { name: string, chainId: number, explorer?: string },
  *   corsOrigin?: string | string[] | boolean,
  *   rateLimits?: boolean,
  *   trustProxy?: boolean | number | string,
@@ -79,12 +87,8 @@ export function createApp({
   chain,
   store,
   auth,
-  institutionName,
-  trustedIssuer,
-  connect,
-  ledger,
-  walletKey,
-  fundingWei = 10n ** 18n,
+  ipfs = null,
+  network = { name: 'localhost', chainId: 31337 },
   corsOrigin = true,
   rateLimits = true,
   trustProxy = false,
@@ -97,23 +101,11 @@ export function createApp({
   const loginLimit = limiter(rateLimits, 15 * 60 * 1000, 20);
   const verifyLimit = limiter(rateLimits, 60 * 1000, 120);
   const writeLimit = limiter(rateLimits, 60 * 1000, 60);
-  // Public endpoints that re-check or re-mine the whole chain cost seconds of CPU each.
-  const heavyLimit = limiter(rateLimits, 60 * 1000, 6);
 
   const audit = (req, action, target = null, details = null) =>
     store.addAudit({ actor: req.user?.sub ?? null, action, target, ip: req.ip, details });
 
-  // Institutions the platform vouches for: the contract owner (root) plus every
-  // approved institution, each signing with its own on-chain issuer wallet.
-  const institutions = createInstitutionService({
-    chain,
-    connect,
-    store,
-    walletKey,
-    fundingWei,
-    rootName: institutionName,
-    trustedIssuer,
-  });
+  const institutions = createInstitutionService({ chain, store });
   const actingInstitution = async (req) => {
     try {
       return await institutions.forUser(req.user);
@@ -121,33 +113,46 @@ export function createApp({
       throw new HttpError(err.status ?? 403, err.message);
     }
   };
-  // Records issued before multi-institution support belong to the root.
-  const institutionOf = async (record) =>
-    record.institutionId ? store.getInstitution(record.institutionId) : institutions.root();
   // A university manages only its own credentials.
-  const mayManage = (_req, record, actor) =>
-    (record.institutionId ?? institutions.rootId) === actor.id;
+  const mayManage = (record, actor) => record.institutionId === actor.id;
 
-  // Everything printed on a downloaded marks card, confirmed against the chain.
-  async function printableCard(degree, credential) {
-    const view = degree ? viewFromDegree(degree) : viewFromCredential(credential);
-    const marks = degree ? await store.getMarks(degree.enrollment_id) : null;
-    if (marks) Object.assign(view, { semesters: marks.semesters, batch: marks.batch, medium: marks.medium });
-    const onChain = await chain.getById(view.credentialId);
-    const hash = sha256(view.canonical);
+  // ---- reading the contract -------------------------------------------------
+
+  /** What the contract says about one stored credential (individual or Merkle batch). */
+  async function onChainFor(record) {
+    const chainView = record.batch
+      ? await chain.verifyBatch({
+          batchId: record.batch.batchId,
+          credentialId: record.credentialId,
+          hash: record.hash,
+          proof: record.batch.proof,
+        })
+      : await chain.getById(record.credentialId);
+    if (!chainView) return null;
+    const txHash = record.chain?.txHash;
+    const tx = txHash && TX_PATTERN.test(txHash) ? await chain.transaction(txHash) : null;
     return {
-      view,
-      hash,
-      txId: onChain?.txId ?? null,
-      block: onChain?.block ?? null,
-      status: onChain?.status ?? 'unknown',
-      marksVerified: Boolean(marks && onChain?.marksHash && sha256(marksString(marks.semesters)) === onChain.marksHash),
+      ...chainView,
+      docHash: chainView.hash,
+      proof: {
+        network: network.name,
+        contract: await chain.address(),
+        mode: record.batch ? 'merkle-batch' : 'individual',
+        txHash: tx?.txHash ?? txHash ?? null,
+        blockNumber: tx?.blockNumber ?? record.chain?.blockNumber ?? null,
+        blockHash: tx?.blockHash ?? null,
+        confirmations: tx?.confirmations ?? null,
+        ...(record.batch
+          ? { batchId: record.batch.batchId, merkleRoot: record.batch.root, merkleProof: record.batch.proof, merkleProofValid: true }
+          : {}),
+      },
     };
   }
 
   // ---- issuance helpers ----------------------------------------------------
 
-  function validateIssueInput(body, issuerName) {
+  function validateIssueInput(body, issuerName, { requireId = false } = {}) {
+    if (requireId && !body.credentialId) throw new HttpError(400, 'credentialId is required.');
     const fields = {
       studentName: String(body.studentName ?? '').trim(),
       studentId: String(body.studentId ?? '').trim(),
@@ -158,21 +163,20 @@ export function createApp({
         : `COR-${new Date().getFullYear()}-${randomHex(3).toUpperCase()}`,
       issuer: issuerName,
     };
-    // The printed reference is derived, not random, so a retried issue rebuilds
-    // exactly the same certificate file and file hash.
-    fields.txHash = body.txHash ? String(body.txHash) : `0x${sha256(`certificate-ref|${fields.credentialId}|${issuerName}`)}`;
     const missing = ['studentName', 'studentId', 'credentialType'].filter((k) => !fields[k]);
     if (missing.length) throw new HttpError(400, `Missing required field(s): ${missing.join(', ')}.`);
     if (['studentName', 'studentId', 'credentialType'].some((k) => fields[k].length > MAX_TEXT)) {
       throw new HttpError(400, `Fields must be at most ${MAX_TEXT} characters.`);
     }
     if (!ID_PATTERN.test(fields.credentialId)) throw new HttpError(400, 'Invalid credential ID format.');
-    if (!CERT_REF_PATTERN.test(fields.txHash)) throw new HttpError(400, 'Invalid certificate reference.');
     if (!DATE_PATTERN.test(fields.issueDate) || Number.isNaN(Date.parse(fields.issueDate))) {
       throw new HttpError(400, 'issueDate must be a valid YYYY-MM-DD date.');
     }
     return fields;
   }
+
+  // The server, not the browser, decides what gets hashed.
+  const docHashOf = (fields) => documentHash(issuedCanonical(fields));
 
   function validateStudentEmail(value) {
     if (value == null || value === '') return null;
@@ -181,8 +185,6 @@ export function createApp({
     return email;
   }
 
-  // Checked before anything is written, so a clash never leaves a credential
-  // anchored on-chain with a failed request.
   async function assertEmailFree(email, studentId) {
     if (!email) return;
     const owner = await store.findStudentByEmail(email);
@@ -195,119 +197,101 @@ export function createApp({
   // the student can later create a login with their personal email.
   async function recordStudent(fields, email, institution) {
     try {
-      await store.upsertStudent({
-        studentId: fields.studentId,
-        fullName: fields.studentName,
-        email,
-        institutionId: institution.id,
-      });
+      await store.upsertStudent({ studentId: fields.studentId, fullName: fields.studentName, email, institutionId: institution.id });
     } catch (err) {
       if (err.code === '23505') throw new HttpError(409, 'That student email already belongs to another student.');
       throw err;
     }
   }
 
-  async function issue(fields, institution, extra = {}) {
-    if (await store.get(fields.credentialId)) {
-      throw new HttpError(409, `Credential ID "${fields.credentialId}" already exists.`);
+  async function confirmedTransaction(txHash) {
+    if (txHash == null) return null;
+    if (!TX_PATTERN.test(String(txHash))) throw new HttpError(400, 'txHash must be a 0x-prefixed transaction hash.');
+    const tx = await chain.transaction(txHash);
+    if (!tx || !tx.succeeded || !tx.toContract) {
+      throw new HttpError(409, 'That transaction is not a successful call to this contract (yet).', { code: 'tx_not_confirmed' });
     }
-    // The backend, not the client, computes the fingerprint that goes on-chain.
-    const hash = await computeSha256Hex(buildCertificateBytes(fields));
-    const bridge = await institutions.bridgeFor(institution);
-    // certHash is over the certificate's data, so a photo of it can be checked too.
-    const receipt =
-      (await issuedEarlier(fields.credentialId, hash, institution)) ??
-      (await bridge.issue(fields.credentialId, hash, {
-        certNo: fields.credentialId,
-        certHash: sha256(issuedCanonical(fields)),
-      }));
-    const record = await store.insert({
-      ...fields,
-      ...extra,
-      institutionId: institution.id,
-      issuerAddress: institution.walletAddress,
-      hash,
-      status: 'valid',
-      revocation: null,
+    return tx;
+  }
+
+  // ---- IPFS -------------------------------------------------------------------
+
+  /** The document stored (encrypted) on IPFS: everything needed to re-check it. */
+  function ipfsDocument(record, view, semesters) {
+    return {
+      v: 1,
+      credentialId: record.credentialId,
+      certificateNo: view.certificateNo,
+      canonical: view.canonical,
+      semesters: semesters ?? [],
+      docHash: record.hash,
+      view,
       chain: {
-        mode: 'individual',
-        txHash: receipt.txHash,
-        blockNumber: receipt.blockNumber,
-        gasUsed: String(receipt.gasUsed),
-        contract: await chain.address(),
+        network: network.name,
+        chainId: network.chainId,
+        txHash: record.chain?.txHash ?? null,
+        blockNumber: record.chain?.blockNumber ?? null,
+        ...(record.batch ? { batchId: record.batch.batchId, merkleRoot: record.batch.root, merkleProof: record.batch.proof } : {}),
       },
-    });
-    return { credentialId: record.credentialId, hash, txHash: record.txHash, qrPayload: record.credentialId, record };
+    };
   }
 
-  // An earlier attempt can reach the chain and then fail to save the record.
-  // A retry with the same certificate finishes the save; anything else is a duplicate.
-  async function issuedEarlier(credentialId, hash, institution) {
-    const onChain = await chain.getById(credentialId);
-    if (!onChain) return null;
-    const sameIssuer = onChain.issuer?.toLowerCase() === institution.walletAddress?.toLowerCase();
-    if (onChain.hash !== hash || !sameIssuer || onChain.status !== 'valid') {
-      throw new HttpError(409, `Credential ID "${credentialId}" already exists on the blockchain.`);
+  /** Best effort: a record without an IPFS copy still verifies through the contract. */
+  async function ensurePinned(record, view, semesters) {
+    if (!ipfs || record.ipfs) return record.ipfs ?? null;
+    try {
+      const pinned = await ipfs.pinEncrypted(ipfsDocument(record, view, semesters), record.credentialId);
+      await store.update(record.credentialId, { ipfs: pinned });
+      return pinned;
+    } catch (err) {
+      console.error(`[ipfs] ${record.credentialId}: ${err.message}`);
+      return null;
     }
-    return { txHash: onChain.txId ? `0x${onChain.txId}` : null, blockNumber: onChain.block ?? null, gasUsed: 0 };
   }
 
-  async function revokedEarlier(record) {
-    if (record.batch) return null;
-    if ((await chain.getById(record.credentialId))?.status !== 'revoked') return null;
-    const event = (await chain.history(record.credentialId)).findLast((e) => e.type === 'revoked');
-    return { txHash: event?.txHash ?? null, blockNumber: event?.blockNumber ?? null, gasUsed: 0 };
-  }
-
-  async function revoke(req, credentialId, reasonInput) {
-    const record = await store.get(credentialId);
-    if (!record) throw new HttpError(404, 'Credential not found.');
-    const actor = await actingInstitution(req);
-    if (!mayManage(req, record, actor)) {
-      throw new HttpError(403, 'Only the institution that issued this credential can revoke it.');
+  // Everything printed on a downloaded marks card, confirmed against the contract.
+  async function printableCard(degree, credential) {
+    const view = degree ? viewFromDegree(degree) : viewFromCredential(credential);
+    const marks = degree ? await store.getMarks(degree.enrollment_id) : null;
+    if (marks) Object.assign(view, { semesters: marks.semesters, batch: marks.batch, medium: marks.medium });
+    const record = credential ?? (await store.get(degree.credential_id));
+    if (!record) {
+      return { view, hash: null, txId: null, block: null, status: 'unknown', marksVerified: false, ipfs: null };
     }
-    if (record.status === 'revoked') throw new HttpError(409, 'Credential is already revoked.');
-    const reason = String(reasonInput ?? '').trim().slice(0, 500) || 'No reason provided.';
-    const bridge = await institutions.bridgeFor(await institutionOf(record));
-    const receipt =
-      (await revokedEarlier(record)) ??
-      (record.batch
-        ? await bridge.revokeBatch({ ...record.batch, credentialId, hash: record.hash }, reason)
-        : await bridge.revoke(credentialId, reason));
-    return store.update(credentialId, {
-      status: 'revoked',
-      revocation: {
-        reason,
-        date: today(),
-        txHash: receipt.txHash,
-        blockNumber: receipt.blockNumber,
-        gasUsed: String(receipt.gasUsed),
-      },
-    });
+    const onChain = await onChainFor(record);
+    const recomputed = documentHash(view.canonical, marks?.semesters ?? []);
+    const matches = Boolean(onChain) && recomputed === onChain.docHash && recomputed === record.hash;
+    const pinned = await ensurePinned(record, view, marks?.semesters);
+    return {
+      view,
+      hash: hex64(record.hash),
+      txId: record.chain?.txHash ?? null,
+      block: record.chain?.blockNumber ?? null,
+      status: matches ? onChain.status : 'unknown',
+      marksVerified: matches,
+      ipfs: pinned,
+      chain: onChain?.proof ?? null,
+    };
   }
 
   // ---- verification --------------------------------------------------------
 
-  // The chain is the source of truth for hash + status; the off-chain record
-  // only supplies human-readable details, and is itself cross-checked.
+  // The contract is the source of truth for hash and status; the stored
+  // record only supplies human-readable details, and is itself cross-checked.
   async function evaluate(onChain, record, query) {
     const trusted = onChain.issuerActive ? await institutions.trustedByAddress(onChain.issuer) : null;
     if (!trusted) {
       return {
         status: 'invalid',
         code: 'untrusted_issuer',
-        details: {
-          reason: 'This credential was not issued by an institution approved on this platform.',
-          issuer: onChain.issuer,
-          ...query,
-        },
+        details: { reason: 'This credential was not issued by an institution approved on this platform.', issuer: onChain.issuer, ...query },
       };
     }
-    if (record && record.hash !== onChain.hash) return recordMismatch(query);
+    if (record && record.hash !== onChain.docHash) return recordMismatch(query);
     const details = {
       ...(record ?? { credentialId: query.submittedId ?? null, issuer: trusted.name }),
       issuerInstitution: { id: trusted.id, name: trusted.name, address: onChain.issuer },
-      hash: onChain.hash,
+      hash: onChain.docHash,
       status: onChain.status,
       onChain,
     };
@@ -317,52 +301,38 @@ export function createApp({
   const recordMismatch = (query) => ({
     status: 'invalid',
     code: 'record_mismatch',
-    details: {
-      reason: 'The institution record does not match the fingerprint anchored on-chain.',
-      ...query,
-    },
+    details: { reason: 'The institution record does not match the document hash in the smart contract.', ...query },
   });
 
-  // Batch credentials aren't indexed on-chain individually; the off-chain
-  // record supplies the Merkle proof and the contract checks it.
-  async function verifyBatchRecord(record, query) {
-    const onChain = await chain.verifyBatch({ ...record.batch, credentialId: record.credentialId, hash: record.hash });
-    return onChain ? evaluate(onChain, record, query) : recordMismatch(query);
-  }
+  const findRecord = async (submitted) =>
+    (await store.get(submitted)) ?? (await store.findByCertificateNo(submitted)) ?? (await store.get(chainIdOf(submitted)));
 
-  // Accepts our credential ID or the number printed on the certificate
-  // (e.g. "VTU/DC/2023/000005").
+  // Accepts our credential ID or the number printed on the certificate.
   async function verifyById(submitted) {
-    const record = (await store.get(submitted)) ?? (await store.findByCertificateNo(submitted));
-    const credentialId = record?.credentialId ?? submitted;
-    const onChain = await chain.getById(credentialId);
+    const record = await findRecord(submitted);
     const query = { submittedId: submitted };
+    const onChain = record ? await onChainFor(record) : await chain.getById(submitted).then((c) => c && { ...c, docHash: c.hash });
     if (onChain) return evaluate(onChain, record, query);
-    if (record?.batch) return verifyBatchRecord(record, query);
     return {
       status: 'invalid',
       code: 'not_found',
-      details: {
-        reason: `No credential found on-chain matching ID "${submitted}".`,
-        submittedId: submitted,
-        submittedHash: null,
-      },
+      details: { reason: `No credential found in the smart contract matching ID "${submitted}".`, submittedId: submitted, submittedHash: null },
     };
   }
 
   async function verifyByHash(hashInput) {
-    const hash = '0x' + String(hashInput).toLowerCase().replace(/^0x/, '');
-    const onChain = await chain.getByHash(hash);
+    const hash = '0x' + hex64(hashInput);
     const query = { submittedHash: hash };
-    if (onChain) return evaluate(onChain, await store.findByHash(hash), query);
+    const individual = await chain.getByHash(hash);
+    if (individual) return evaluate({ ...individual, docHash: individual.hash }, await store.findByHash(hash), query);
     const record = await store.findByHash(hash);
-    if (record?.batch) return verifyBatchRecord(record, query);
+    const onChain = record?.batch ? await onChainFor(record) : null;
+    if (onChain) return evaluate(onChain, record, query);
     return {
       status: 'invalid',
       code: 'hash_mismatch',
       details: {
-        reason:
-          'The computed document hash does not match any record on-chain. The file may have been altered, or was never issued through this system.',
+        reason: 'This document hash is not in the smart contract. The certificate may have been altered, or was never issued through this system.',
         submittedId: null,
         submittedHash: hash,
       },
@@ -374,15 +344,12 @@ export function createApp({
   app.get(
     '/api/health',
     asyncRoute(async (_req, res) => {
-      let contract = null;
-      let paused = null;
       try {
-        contract = await chain.address();
-        paused = await chain.paused();
+        const [contract, paused] = await Promise.all([chain.address(), chain.paused()]);
+        res.json({ ok: true, chain: 'reachable', network: network.name, contract, paused, store: store.kind, ipfs: Boolean(ipfs) });
       } catch {
-        return res.status(503).json({ ok: false, chain: 'unavailable', store: store.kind });
+        res.status(503).json({ ok: false, chain: 'unavailable', store: store.kind });
       }
-      res.json({ ok: true, chain: 'reachable', contract, paused, store: store.kind });
     })
   );
 
@@ -396,9 +363,7 @@ export function createApp({
       if (!result.ok) {
         await store.addAudit({ actor: username || null, action: 'login_failed', ip: req.ip, details: { reason: result.reason } });
         if (result.reason === 'locked') {
-          return res
-            .status(423)
-            .json({ error: 'Account temporarily locked after repeated failed sign-ins.', code: 'locked' });
+          return res.status(423).json({ error: 'Account temporarily locked after repeated failed sign-ins.', code: 'locked' });
         }
         if (result.reason === 'pending' || result.reason === 'suspended') {
           return res.status(403).json({
@@ -428,11 +393,9 @@ export function createApp({
       const student = await store.findStudentByEmail(email);
       if (!student) {
         await store.addAudit({ actor: email, action: 'student_register_refused', ip: req.ip });
-        throw new HttpError(
-          404,
-          'No student record uses this email. Ask your institution to add your personal email to your record.',
-          { code: 'no_student_record' }
-        );
+        throw new HttpError(404, 'No student record uses this email. Ask your institution to add your personal email to your record.', {
+          code: 'no_student_record',
+        });
       }
       let passwordHash;
       try {
@@ -441,14 +404,7 @@ export function createApp({
         throw new HttpError(400, err.message);
       }
       try {
-        await store.createUser({
-          username: email,
-          email,
-          passwordHash,
-          role: 'student',
-          studentId: student.studentId,
-          institutionId: student.institutionId,
-        });
+        await store.createUser({ username: email, email, passwordHash, role: 'student', studentId: student.studentId, institutionId: student.institutionId });
       } catch (err) {
         if (err.code === '23505') throw new HttpError(409, 'An account already exists for this email. Sign in instead.');
         throw err;
@@ -458,8 +414,8 @@ export function createApp({
     })
   );
 
-  // Any institution can apply; it can issue only after the platform admin
-  // approves it (which creates and authorizes its on-chain wallet).
+  // Any institution can apply with the MetaMask address it will sign with; it
+  // can issue only after the platform admin authorises that address on-chain.
   app.post(
     '/api/institutions/register',
     loginLimit,
@@ -472,9 +428,7 @@ export function createApp({
       const kind = ['university', 'certifying_body', 'employer', 'other'].includes(b.kind) ? b.kind : 'university';
       if (name.length < 3 || name.length > MAX_TEXT) throw new HttpError(400, 'Enter the institution name (3-200 characters).');
       if (!EMAIL_PATTERN.test(email)) throw new HttpError(400, 'Enter a valid official email address.');
-      if (website && !/^https?:\/\/[^\s]+\.[^\s]+$/i.test(website)) {
-        throw new HttpError(400, 'Website must start with http:// or https://.');
-      }
+      if (website && !/^https?:\/\/[^\s]+\.[^\s]+$/i.test(website)) throw new HttpError(400, 'Website must start with http:// or https://.');
       let passwordHash;
       try {
         passwordHash = await hashPassword(String(b.password ?? ''));
@@ -484,7 +438,7 @@ export function createApp({
       if (await store.findUserForLogin(email)) throw new HttpError(409, 'An account already exists for this email.');
       let inst;
       try {
-        inst = await institutions.register({ name, kind, email, website });
+        inst = await institutions.register({ name, kind, email, website, walletAddress: String(b.walletAddress ?? '').trim() });
       } catch (err) {
         throw new HttpError(err.status ?? 400, err.message);
       }
@@ -499,7 +453,6 @@ export function createApp({
     '/api/institutions',
     verifyLimit,
     asyncRoute(async (_req, res) => {
-      await institutions.root();
       const list = (await store.listInstitutions())
         .filter((i) => i.status === 'approved')
         .map(({ id, name, kind, website, walletAddress }) => ({ id, name, kind, website, walletAddress }));
@@ -518,12 +471,12 @@ export function createApp({
         role: req.user.role,
         studentId: req.user.studentId ?? null,
         fullName: student?.fullName ?? null,
-        institution: inst ? { id: inst.id, name: inst.name, status: inst.status } : null,
+        institution: inst ? { id: inst.id, name: inst.name, status: inst.status, walletAddress: inst.walletAddress } : null,
       });
     })
   );
 
-  // Printable certificates, with the fingerprint for their QR code.
+  // Printable certificates, with the document hash and IPFS link for their QR code.
   app.get(
     '/api/me/certificates',
     ...auth.requireRole('student'),
@@ -541,7 +494,7 @@ export function createApp({
     asyncRoute(async (req, res) => res.json(await store.listByStudent(req.user.studentId)))
   );
 
-  // Public read for the student portal and shared public profile pages.
+  // Public read for the shared student profile page.
   app.get(
     '/api/students/:studentId/credentials',
     verifyLimit,
@@ -570,9 +523,7 @@ export function createApp({
     verifyLimit,
     express.json({ limit: '10kb' }),
     asyncRoute(async (req, res) => {
-      if (!HASH_PATTERN.test(String(req.body?.hash ?? ''))) {
-        throw new HttpError(400, 'hash must be a 32-byte hex SHA-256 digest.');
-      }
+      if (!HASH_PATTERN.test(String(req.body?.hash ?? ''))) throw new HttpError(400, 'hash must be a 32-byte hex SHA-256 digest.');
       res.json(await verifyByHash(req.body.hash));
     })
   );
@@ -585,18 +536,19 @@ export function createApp({
     express.json({ limit: '64kb' }),
     asyncRoute(async (req, res) => {
       const ocrText = String(req.body?.ocrText ?? '').slice(0, 20000);
-      const qrText = String(req.body?.qrText ?? '').slice(0, 500);
+      const qrText = String(req.body?.qrText ?? '').slice(0, 2000);
       if (!ocrText.trim() && !qrText.trim()) throw new HttpError(400, 'No text or QR code was read from the photo.');
-      if (!ledger) throw new HttpError(501, 'Photo verification needs the project blockchain.');
       res.json(
         await verifyCertificateEvidence(
           { ocrText, qrText },
           {
             findDegree: (no) => store.findDegreeRecord(no),
             findCredential: (no) => store.findCertificateNoInsensitive(no),
-            ledgerGet: (id) => chain.getById(id),
+            onChain: async ({ degree, credential, number }) => {
+              const record = credential ?? (degree ? await store.get(degree.credential_id) : await findRecord(number));
+              return record ? onChainFor(record) : null;
+            },
             issuerTrusted: (address) => institutions.trustedByAddress(address),
-            proof: (txId) => ledger.explorer.inclusionProof(txId),
             findMarks: async (enrollmentId) => (await store.getMarks(enrollmentId))?.semesters ?? null,
             knownPrefixes: async () => (await store.listInstitutions()).map((i) => i.shortCode).filter(Boolean),
           }
@@ -605,67 +557,35 @@ export function createApp({
     })
   );
 
-  // ---- routes: the blockchain itself (public, read-only; no personal data) -----
-  if (ledger) {
-    app.get('/api/chain/summary', verifyLimit, asyncRoute(async (_req, res) => res.json(await ledger.explorer.summary())));
-    app.get(
-      '/api/chain/blocks',
-      verifyLimit,
-      asyncRoute(async (req, res) => {
-        const from = req.query.from == null ? undefined : Number(req.query.from);
-        const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
-        res.json(await ledger.explorer.blocks({ from, limit }));
-      })
-    );
-    app.get(
-      '/api/chain/blocks/:index',
-      verifyLimit,
-      asyncRoute(async (req, res) => {
-        const block = await ledger.explorer.block(Number(req.params.index));
-        if (!block) throw new HttpError(404, 'No such block.');
-        res.json(block);
-      })
-    );
-    // Re-validates every node's copy from block 0, including all signatures.
-    app.get('/api/chain/audit', heavyLimit, asyncRoute(async (_req, res) => res.json(await ledger.explorer.audit({ deep: true }))));
-    // Attacks a throwaway copy of the chain; nothing is saved.
-    app.post(
-      '/api/chain/simulate-tamper',
-      heavyLimit,
-      express.json({ limit: '1kb' }),
-      asyncRoute(async (req, res) => {
-        const result = await ledger.explorer.simulateTamper(Number(req.body?.block) || 0);
-        if (!result) throw new HttpError(404, 'No certificate at or after that block.');
-        res.json(result);
-      })
-    );
-  }
-
-  // Raw certificate upload. The server recomputes SHA-256 itself, so a
-  // verifier does not have to trust a client-side hash.
-  app.post(
-    '/api/verify/file',
-    verifyLimit,
-    express.raw({ type: () => true, limit: '5mb' }),
-    asyncRoute(async (req, res) => {
-      const bytes = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
-      if (bytes.length < 5 || bytes.subarray(0, 5).toString('latin1') !== '%PDF-') {
-        throw new HttpError(415, 'File rejected: only PDF certificates can be verified.', {
-          status: 'rejected',
-          code: 'invalid_file',
-        });
-      }
-      res.json(await verifyByHash(await computeSha256Hex(bytes)));
-    })
-  );
-
-  // ---- routes: admin ----------------------------------------------------------
+  // ---- routes: universities (sign in MetaMask, the server confirms) ----------
 
   // Platform admin: approves institutions, registry controls, audit log.
   const admin = auth.requireRole('admin');
   // University registrars: issue, revoke and list their own credentials.
   const issuer = auth.requireRole('institution');
 
+  // Step 1 of issuing: the document hash the university will sign in MetaMask.
+  app.post(
+    '/api/credentials/prepare',
+    ...issuer,
+    writeLimit,
+    express.json({ limit: '20kb' }),
+    asyncRoute(async (req, res) => {
+      const inst = await actingInstitution(req);
+      const fields = validateIssueInput(req.body ?? {}, inst.name);
+      await assertEmailFree(validateStudentEmail(req.body?.studentEmail), fields.studentId);
+      if (await store.get(fields.credentialId)) throw new HttpError(409, `Credential ID "${fields.credentialId}" already exists.`);
+      const docHash = docHashOf(fields);
+      const existing = await chain.getById(fields.credentialId);
+      if (existing && existing.hash !== docHash) {
+        throw new HttpError(409, `Credential ID "${fields.credentialId}" is already in the smart contract for another document.`);
+      }
+      res.json({ credentialId: fields.credentialId, docHash, issuerAddress: inst.walletAddress, alreadyOnChain: Boolean(existing), fields });
+    })
+  );
+
+  // Step 2: after the MetaMask transaction is mined, record it - but only what
+  // the contract confirms: this ID, this exact hash, signed by this university.
   app.post(
     '/api/credentials',
     ...issuer,
@@ -673,136 +593,142 @@ export function createApp({
     express.json({ limit: '20kb' }),
     asyncRoute(async (req, res) => {
       const inst = await actingInstitution(req);
-      const fields = validateIssueInput(req.body ?? {}, inst.name);
+      const fields = validateIssueInput(req.body ?? {}, inst.name, { requireId: true });
       const email = validateStudentEmail(req.body?.studentEmail);
       await assertEmailFree(email, fields.studentId);
-      const issued = await issue(fields, inst);
-      await recordStudent(fields, email, inst);
-      await audit(req, 'credential_issued', issued.credentialId, {
-        txHash: issued.record.chain.txHash,
-        institution: inst.id,
+      if (await store.get(fields.credentialId)) throw new HttpError(409, `Credential ID "${fields.credentialId}" already exists.`);
+
+      const docHash = docHashOf(fields);
+      const onChain = await chain.getById(fields.credentialId);
+      if (!onChain) {
+        throw new HttpError(409, 'The smart contract has no credential with this ID yet. Sign it in MetaMask and wait for the transaction to be mined.', {
+          code: 'not_on_chain',
+        });
+      }
+      if (onChain.hash !== docHash) throw new HttpError(409, 'The hash in the smart contract does not match these details.', { code: 'hash_mismatch' });
+      if (!sameAddress(onChain.issuer, inst.walletAddress)) {
+        throw new HttpError(403, "This credential was signed by another wallet, not your institution's.", { code: 'wrong_issuer' });
+      }
+      const tx = await confirmedTransaction(req.body?.txHash);
+
+      let replaces = null;
+      if (req.body?.replaces) {
+        const old = await store.get(String(req.body.replaces));
+        if (!old || !mayManage(old, inst)) throw new HttpError(403, 'Only the institution that issued a credential can replace it.');
+        if (old.status !== 'revoked') throw new HttpError(409, 'Revoke the old credential before issuing its replacement.');
+        replaces = old.credentialId;
+      }
+
+      const record = await store.insert({
+        ...fields,
+        txHash: tx?.txHash ?? docHash,
+        hash: docHash,
+        status: onChain.status,
+        revocation: null,
+        institutionId: inst.id,
+        issuerAddress: inst.walletAddress,
+        replaces,
+        chain: { mode: 'individual', network: network.name, contract: await chain.address(), txHash: tx?.txHash ?? null, blockNumber: tx?.blockNumber ?? null },
       });
-      res.status(201).json(issued);
+      if (replaces) await store.update(replaces, { replacedBy: record.credentialId });
+      await recordStudent(fields, email, inst);
+      await ensurePinned(record, viewFromCredential(record), []);
+      await audit(req, replaces ? 'credential_reissued' : 'credential_issued', record.credentialId, {
+        txHash: record.chain.txHash,
+        institution: inst.id,
+        ...(replaces ? { replaces } : {}),
+      });
+      res.status(201).json({ credentialId: record.credentialId, hash: docHash, txHash: record.chain.txHash, record: await store.get(record.credentialId) });
     })
   );
 
-  // Merkle batch issuance: many credentials, one transaction, one root.
+  function validateBatch(items, inst, requireId) {
+    if (!Array.isArray(items) || items.length === 0) throw new HttpError(400, 'credentials must be a non-empty array.');
+    if (items.length > MAX_BATCH) throw new HttpError(400, `A batch can hold at most ${MAX_BATCH} credentials.`);
+    const fieldsList = items.map((item, i) => {
+      try {
+        return validateIssueInput(item ?? {}, inst.name, { requireId });
+      } catch (err) {
+        throw new HttpError(400, `Item ${i}: ${err.message}`);
+      }
+    });
+    const ids = new Set();
+    for (const f of fieldsList) {
+      if (ids.has(f.credentialId)) throw new HttpError(409, `Duplicate credential ID "${f.credentialId}" in batch.`);
+      ids.add(f.credentialId);
+    }
+    const hashes = fieldsList.map(docHashOf);
+    return { fieldsList, hashes, tree: buildMerkleTree(fieldsList.map((f, i) => leafOf(f.credentialId, hashes[i]))) };
+  }
+
+  // Merkle batch, step 1: one root covering many credentials, signed once.
+  app.post(
+    '/api/credentials/batch/prepare',
+    ...issuer,
+    writeLimit,
+    express.json({ limit: '1mb' }),
+    asyncRoute(async (req, res) => {
+      const inst = await actingInstitution(req);
+      const items = req.body?.credentials;
+      const { fieldsList, hashes, tree } = validateBatch(items, inst, false);
+      for (const [i, f] of fieldsList.entries()) {
+        await assertEmailFree(validateStudentEmail(items[i]?.studentEmail), f.studentId);
+        if (await store.get(f.credentialId)) throw new HttpError(409, `Credential ID "${f.credentialId}" already exists.`);
+      }
+      res.json({
+        root: tree.root,
+        count: fieldsList.length,
+        credentials: fieldsList.map((f, i) => ({ ...f, studentEmail: items[i]?.studentEmail ?? null, docHash: hashes[i] })),
+      });
+    })
+  );
+
+  // Merkle batch, step 2: record it once the contract holds this root under this university.
   app.post(
     '/api/credentials/batch',
     ...issuer,
     writeLimit,
     express.json({ limit: '1mb' }),
     asyncRoute(async (req, res) => {
-      const items = req.body?.credentials;
-      if (!Array.isArray(items) || items.length === 0) {
-        throw new HttpError(400, 'credentials must be a non-empty array.');
-      }
-      if (items.length > MAX_BATCH) throw new HttpError(400, `A batch can hold at most ${MAX_BATCH} credentials.`);
       const inst = await actingInstitution(req);
-
-      const fieldsList = items.map((item, i) => {
-        try {
-          return validateIssueInput(item ?? {}, inst.name);
-        } catch (err) {
-          throw new HttpError(400, `Item ${i}: ${err.message}`);
-        }
-      });
+      const items = req.body?.credentials;
+      const { fieldsList, hashes, tree } = validateBatch(items, inst, true);
       const emails = items.map((item) => validateStudentEmail(item?.studentEmail));
-      for (const [i, f] of fieldsList.entries()) await assertEmailFree(emails[i], f.studentId);
-      const ids = new Set();
-      for (const f of fieldsList) {
-        if (ids.has(f.credentialId)) throw new HttpError(409, `Duplicate credential ID "${f.credentialId}" in batch.`);
-        ids.add(f.credentialId);
-        if (await store.get(f.credentialId)) {
-          throw new HttpError(409, `Credential ID "${f.credentialId}" already exists.`);
-        }
+      for (const [i, f] of fieldsList.entries()) {
+        await assertEmailFree(emails[i], f.studentId);
+        if (await store.get(f.credentialId)) throw new HttpError(409, `Credential ID "${f.credentialId}" already exists.`);
       }
-
-      const hashes = await Promise.all(fieldsList.map((f) => computeSha256Hex(buildCertificateBytes(f))));
-      const issuerBridge = await institutions.bridgeFor(inst);
-      if (issuerBridge.issueMany) {
-        // Own chain: each certificate is a signed transaction; blocks hold up to 25.
-        // Certificates an earlier, interrupted attempt already recorded are not sent again.
-        const receipts = await Promise.all(fieldsList.map((f, i) => issuedEarlier(f.credentialId, hashes[i], inst)));
-        const pending = receipts.flatMap((r, i) => (r ? [] : [i]));
-        const fresh = pending.length
-          ? await issuerBridge.issueMany(
-              pending.map((i) => ({
-                credentialId: fieldsList[i].credentialId,
-                certNo: fieldsList[i].credentialId,
-                hash: hashes[i],
-                certHash: sha256(issuedCanonical(fieldsList[i])),
-              }))
-            )
-          : [];
-        pending.forEach((i, k) => (receipts[i] = fresh[k]));
-        const contract = await chain.address();
-        const records = await store.insertMany(
-          fieldsList.map((f, i) => ({
-            ...f,
-            institutionId: inst.id,
-            issuerAddress: inst.walletAddress,
-            hash: hashes[i],
-            status: 'valid',
-            revocation: null,
-            chain: {
-              mode: 'own-chain',
-              txHash: receipts[i].txHash,
-              blockNumber: receipts[i].blockNumber,
-              gasUsed: '0',
-              contract,
-            },
-          }))
-        );
-        for (const [i, f] of fieldsList.entries()) await recordStudent(f, emails[i], inst);
-        const lastBlock = receipts.at(-1).blockNumber;
-        await audit(req, 'batch_issued', `block:${lastBlock}`, { institution: inst.id, count: records.length });
-        return res.status(201).json({
-          batchId: lastBlock,
-          root: receipts.at(-1).blockHash,
-          txHash: receipts.at(-1).txHash,
-          gasUsed: '0',
-          count: records.length,
-          blocks: new Set(receipts.map((r) => r.blockNumber)).size,
-          credentials: records.map((r) => ({ credentialId: r.credentialId, hash: r.hash })),
-        });
+      const batchId = Number(req.body?.batchId);
+      if (!Number.isInteger(batchId) || batchId < 1) throw new HttpError(400, 'batchId is required.');
+      const onChain = await chain.batchInfo(batchId);
+      if (!onChain) throw new HttpError(409, 'The smart contract has no such batch yet.', { code: 'not_on_chain' });
+      if (onChain.root !== tree.root.toLowerCase() || onChain.count !== fieldsList.length) {
+        throw new HttpError(409, 'The Merkle root in the smart contract does not match these credentials.', { code: 'hash_mismatch' });
       }
-      const tree = buildMerkleTree(fieldsList.map((f, i) => leafOf(f.credentialId, hashes[i])));
-      const receipt = await issuerBridge.anchorBatch(tree.root, fieldsList.length);
+      if (!sameAddress(onChain.issuer, inst.walletAddress)) {
+        throw new HttpError(403, "This batch was signed by another wallet, not your institution's.", { code: 'wrong_issuer' });
+      }
+      const tx = await confirmedTransaction(req.body?.txHash);
       const contract = await chain.address();
-
       const records = await store.insertMany(
         fieldsList.map((f, i) => ({
           ...f,
-          institutionId: inst.id,
-          issuerAddress: inst.walletAddress,
+          txHash: tx?.txHash ?? hashes[i],
           hash: hashes[i],
           status: 'valid',
           revocation: null,
-          batch: { batchId: receipt.batchId, root: tree.root, proof: tree.proof(i), index: i },
-          chain: {
-            mode: 'batch',
-            txHash: receipt.txHash,
-            blockNumber: receipt.blockNumber,
-            gasUsed: String(receipt.gasUsed),
-            contract,
-          },
+          institutionId: inst.id,
+          issuerAddress: inst.walletAddress,
+          batch: { batchId, root: tree.root, proof: tree.proof(i), index: i },
+          chain: { mode: 'batch', network: network.name, contract, txHash: tx?.txHash ?? null, blockNumber: tx?.blockNumber ?? null },
         }))
       );
-      for (const [i, f] of fieldsList.entries()) {
-        await recordStudent(f, emails[i], inst);
-      }
-      await audit(req, 'batch_anchored', `batch:${receipt.batchId}`, {
-        institution: inst.id,
-        count: records.length,
-        root: tree.root,
-        txHash: receipt.txHash,
-      });
+      for (const [i, f] of fieldsList.entries()) await recordStudent(f, emails[i], inst);
+      await audit(req, 'batch_anchored', `batch:${batchId}`, { institution: inst.id, count: records.length, root: tree.root, txHash: tx?.txHash ?? null });
       res.status(201).json({
-        batchId: receipt.batchId,
+        batchId,
         root: tree.root,
-        txHash: receipt.txHash,
-        gasUsed: String(receipt.gasUsed),
+        txHash: tx?.txHash ?? null,
         count: records.length,
         credentials: records.map((r) => ({ credentialId: r.credentialId, hash: r.hash })),
       });
@@ -819,50 +745,36 @@ export function createApp({
     })
   );
 
+  // Revocation: the university signs revokeCredential (or revokeBatchCredential)
+  // in MetaMask; this records it once the contract shows it, with the same reason.
   app.post(
     '/api/credentials/:id/revoke',
     ...issuer,
     writeLimit,
     express.json({ limit: '10kb' }),
     asyncRoute(async (req, res) => {
-      const updated = await revoke(req, req.params.id, req.body?.reason);
-      await audit(req, 'credential_revoked', req.params.id, { txHash: updated.revocation.txHash });
-      res.json(updated);
-    })
-  );
-
-  // Correction flow: the old credential is revoked (never deleted) and a new
-  // one is issued with the corrected fields, the two linked both ways.
-  app.post(
-    '/api/credentials/:id/reissue',
-    ...issuer,
-    writeLimit,
-    express.json({ limit: '20kb' }),
-    asyncRoute(async (req, res) => {
-      const old = await store.get(req.params.id);
-      if (!old) throw new HttpError(404, 'Credential not found.');
+      const record = await store.get(req.params.id);
+      if (!record) throw new HttpError(404, 'Credential not found.');
       const inst = await actingInstitution(req);
-      if (!mayManage(req, old, inst)) {
-        throw new HttpError(403, 'Only the institution that issued this credential can correct it.');
+      if (!mayManage(record, inst)) throw new HttpError(403, 'Only the institution that issued this credential can revoke it.');
+      if (record.status === 'revoked') throw new HttpError(409, 'Credential is already revoked.');
+      const reason = normalizeReason(req.body?.reason);
+      const onChain = await onChainFor(record);
+      if (onChain?.status !== 'revoked') {
+        throw new HttpError(409, 'The smart contract does not show this credential as revoked yet. Sign the revocation in MetaMask first.', {
+          code: 'not_revoked_on_chain',
+        });
       }
-      const body = req.body ?? {};
-      const fields = validateIssueInput(
-        {
-          studentName: body.studentName ?? old.studentName,
-          studentId: body.studentId ?? old.studentId,
-          credentialType: body.credentialType ?? old.credentialType,
-          issueDate: body.issueDate ?? today(),
-          credentialId: body.credentialId,
-        },
-        inst.name
-      );
-      if (old.status !== 'revoked') {
-        await revoke(req, old.credentialId, body.reason || 'Superseded by a corrected credential.');
+      const event = (await chain.history(record.credentialId, record.batch?.batchId)).findLast((e) => e.type === 'revoked');
+      if (!event || event.reasonHash.toLowerCase() !== keccak256(toUtf8Bytes(reason)).toLowerCase()) {
+        throw new HttpError(409, 'The reason does not match the one signed in the smart contract.', { code: 'reason_mismatch' });
       }
-      const issued = await issue(fields, inst, { replaces: old.credentialId });
-      await store.update(old.credentialId, { replacedBy: issued.credentialId });
-      await audit(req, 'credential_reissued', old.credentialId, { replacedBy: issued.credentialId });
-      res.status(201).json(issued);
+      const updated = await store.update(record.credentialId, {
+        status: 'revoked',
+        revocation: { reason, date: today(), txHash: event.txHash, blockNumber: event.blockNumber },
+      });
+      await audit(req, 'credential_revoked', record.credentialId, { txHash: event.txHash });
+      res.json(updated);
     })
   );
 
@@ -873,7 +785,7 @@ export function createApp({
       const record = await store.get(req.params.id);
       if (!record) throw new HttpError(404, 'Credential not found.');
       const inst = await actingInstitution(req);
-      if (!mayManage(req, record, inst)) throw new HttpError(403, 'This credential belongs to another institution.');
+      if (!mayManage(record, inst)) throw new HttpError(403, 'This credential belongs to another institution.');
       const degree = await store.findDegreeRecord(record.certificateNo ?? record.credentialId);
       res.json(await printableCard(degree, degree ? null : record));
     })
@@ -884,25 +796,23 @@ export function createApp({
     asyncRoute(async (req, res) => {
       const record = await store.get(req.params.id);
       if (!record) return res.status(404).json({ error: 'Credential not found.' });
-      res.json(record);
+      const { ipfs: _secret, ...rest } = record; // the document key belongs to the student
+      res.json(rest);
     })
   );
+
+  // ---- routes: platform admin ------------------------------------------------
 
   app.get(
     '/api/admin/institutions',
     ...admin,
     asyncRoute(async (_req, res) => {
-      await institutions.root();
       const counts = await store.countCredentialsByInstitution();
-      res.json(
-        (await store.listInstitutions()).map((i) => ({
-          ...institutions.publicView(i),
-          credentialCount: counts[i.id] ?? 0,
-        }))
-      );
+      res.json((await store.listInstitutions()).map((i) => ({ ...institutions.publicView(i), credentialCount: counts[i.id] ?? 0 })));
     })
   );
 
+  // approve / suspend confirm a setIssuer transaction the admin signed in MetaMask.
   for (const action of ['approve', 'reject', 'suspend']) {
     app.post(
       `/api/admin/institutions/:id/${action}`,
@@ -913,12 +823,11 @@ export function createApp({
         try {
           result = await institutions[action](req.params.id, req.user.sub);
         } catch (err) {
-          if (err.status) throw new HttpError(err.status, err.message);
+          if (err.status) throw new HttpError(err.status, err.message, err.code ? { code: err.code } : {});
           throw err;
         }
         await audit(req, `institution_${action === 'approve' ? 'approved' : action === 'reject' ? 'rejected' : 'suspended'}`, req.params.id, {
           wallet: result.walletAddress ?? null,
-          setIssuerTx: result.setIssuerTx ?? null,
         });
         res.json(institutions.publicView(result));
       })
@@ -938,21 +847,24 @@ export function createApp({
     '/api/admin/registry',
     ...admin,
     asyncRoute(async (_req, res) => {
-      const [contract, owner, paused] = await Promise.all([chain.address(), chain.owner(), chain.paused()]);
-      res.json({ contract, owner, trustedIssuer: (await institutions.root()).walletAddress, paused });
+      const [contract, owner, paused, stats] = await Promise.all([chain.address(), chain.owner(), chain.paused(), chain.stats()]);
+      res.json({ network: network.name, chainId: network.chainId, contract, owner, paused, ...stats });
     })
   );
 
-  // Emergency stop (e.g. suspected key compromise). Verification keeps working.
+  // Emergency stop: the admin signs pause()/unpause() in MetaMask; this records
+  // what the contract now says. Verification keeps working while paused.
   app.post(
     '/api/admin/pause',
     ...admin,
     express.json({ limit: '1kb' }),
     asyncRoute(async (req, res) => {
-      const paused = Boolean(req.body?.paused);
-      const receipt = await chain.setPaused(paused);
-      await audit(req, paused ? 'registry_paused' : 'registry_unpaused', null, { txHash: receipt.txHash });
-      res.json({ paused, txHash: receipt.txHash });
+      const paused = await chain.paused();
+      if (req.body?.paused !== undefined && Boolean(req.body.paused) !== paused) {
+        throw new HttpError(409, `The smart contract is ${paused ? 'paused' : 'not paused'}. Sign the change in MetaMask first.`, { code: 'not_on_chain' });
+      }
+      await audit(req, paused ? 'registry_paused' : 'registry_unpaused', null, null);
+      res.json({ paused });
     })
   );
 
@@ -966,29 +878,17 @@ export function createApp({
       return res.status(503).json({
         status: 'unavailable',
         code: 'chain_unavailable',
-        error: 'Blockchain network is unavailable. Verification cannot be completed right now.',
+        error: 'The Ethereum network is unavailable. Verification cannot be completed right now.',
       });
     }
     if (err instanceof ContractRevertError) {
-      const message =
-        err.reason === 'EnforcedPause'
-          ? 'The registry is paused by the institution. Issuance and revocation are temporarily disabled.'
-          : err.message;
-      return res.status(REVERT_STATUS[err.reason] ?? 400).json({ error: message, code: err.reason });
+      return res.status(REVERT_STATUS[err.reason] ?? 400).json({ error: err.message, code: err.reason });
     }
-    if (err instanceof HttpError) {
-      return res.status(err.status).json({ error: err.message, ...err.extra });
-    }
+    if (err instanceof HttpError) return res.status(err.status).json({ error: err.message, ...err.extra });
     // A unique-key clash in the database: a double submission lost the race.
-    if (err?.code === '23505') {
-      return res.status(409).json({ error: 'This record already exists.' });
-    }
-    if (err?.type === 'entity.too.large') {
-      return res.status(413).json({ status: 'rejected', code: 'invalid_file', error: 'Request body too large.' });
-    }
-    if (err?.type === 'entity.parse.failed') {
-      return res.status(400).json({ error: 'Malformed JSON body.' });
-    }
+    if (err?.code === '23505') return res.status(409).json({ error: 'This record already exists.' });
+    if (err?.type === 'entity.too.large') return res.status(413).json({ status: 'rejected', code: 'invalid_file', error: 'Request body too large.' });
+    if (err?.type === 'entity.parse.failed') return res.status(400).json({ error: 'Malformed JSON body.' });
     console.error(err);
     return res.status(500).json({ error: 'Internal server error.' });
   });

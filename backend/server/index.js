@@ -1,5 +1,5 @@
 // Local/dev entrypoint. Reads configuration from the environment (see
-// .env.example), connects to the database and the deployed registry, and
+// .env.example), connects to the database and the deployed contract, and
 // starts the API.
 
 import 'dotenv/config';
@@ -15,8 +15,8 @@ if (errors.length) {
 }
 
 function loadDeployment() {
-  if (config.network !== 'sepolia') return undefined; // local runs do not touch the public network
-  return JSON.parse(fs.readFileSync(new URL('../deployments/sepolia.json', import.meta.url)));
+  const file = new URL(`../deployments/${config.network}.json`, import.meta.url);
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file)) : undefined;
 }
 
 let runtime;
@@ -29,6 +29,6 @@ try {
 
 runtime.app.listen(config.port, () => {
   console.log(`Chain of Record API on http://localhost:${config.port}`);
-  console.log(`  blockchain: own chain, authority ${runtime.ledger.authority}`);
+  console.log(`  blockchain: CredentialRegistry on ${config.network}`);
   console.log(`  store:    ${runtime.store.kind}`);
 });

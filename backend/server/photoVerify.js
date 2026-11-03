@@ -4,18 +4,19 @@
 // pixels), so the fingerprint is taken over the certificate's *data*, not its
 // file. Steps:
 //   1. Read the certificate number (QR code, else the OCR text).
-//   2. Ask every node (a majority must agree) and walk the hash links from its
-//      block to the newest block. Not there, or broken -> invalid.
+//   2. Read the CredentialRegistry smart contract on Ethereum: the credential
+//      (or its Merkle-batch membership), its status and the transaction's block.
+//      Not there -> invalid.
 //   3. Is the issuer an authorised, active university? No -> invalid.
 //   4. Compare each printed field with the university's record. Different -> invalid.
-//   5. Hash the record's canonical string and semester marks; they must equal
-//      the hashes on the chain. A QR code's hash must match too. Different -> invalid.
-//   6. Chain status revoked -> revoked. Otherwise -> valid.
+//   5. Hash the record's canonical string and semester marks; the result must
+//      equal the docHash in the contract. A QR code's hash must match too. Different -> invalid.
+//   6. Revoked in the contract -> revoked. Otherwise -> valid.
 // OCR misreads letters, so names allow small differences; numbers do not.
 
-import { degreeCanonical, marksString, parseQrPayload, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
+import { degreeCanonical, parseQrPayload, viewFromCredential, viewFromDegree } from '../../src/lib/certificateView.js';
+import { documentHash } from './hash.js';
 
-import { sha256 } from '../blockchain/index.js';
 const SERIAL = /\b([A-Za-z]{2,10})\s*\/\s*(P?D?DC|PDC|DC)\s*\/\s*([0-9OoIlSB]{4})\s*\/\s*([0-9OoIlSB]{6})\b/;
 const COR_ID = /\b(COR-\d{4}-[A-Za-z0-9]{4,12})\b/i;
 
@@ -168,8 +169,10 @@ const verdict = (result, code, reason, extra = {}) => ({ verdict: result, code, 
 
 /**
  * @param {{ ocrText?: string, qrText?: string }} input
- * @param {{ findDegree: Function, findCredential: Function, ledgerGet: Function,
- *           issuerTrusted: Function, proof: Function }} deps
+ * @param {{ findDegree: Function, findCredential: Function, issuerTrusted: Function,
+ *           onChain: ({ degree, credential, number }) => Promise<object|null>, findMarks?: Function,
+ *           knownPrefixes?: Function }} deps
+ *        onChain answers from the smart contract: { docHash, status, issuer, revokedAt, proof }
  */
 export async function verifyCertificateEvidence({ ocrText = '', qrText = '' }, deps) {
   const qr = parseQrPayload(qrText);
@@ -190,15 +193,11 @@ export async function verifyCertificateEvidence({ ocrText = '', qrText = '' }, d
       }
     }
   }
-  const onChain = await deps.ledgerGet(degree?.credential_id ?? credential?.credentialId ?? number);
+  const onChain = await deps.onChain({ degree, credential, number });
   if (!onChain) {
     return verdict('invalid', 'not_on_chain', `Certificate "${number}" is not recorded on the blockchain.`, { certificateNo: number, parsed });
   }
-  const proof = await deps.proof(onChain.txId);
-  const base = { certificateNo: number, parsed, proof, consensus: onChain.consensus };
-  if (proof?.chainWalk && !proof.chainWalk.valid) {
-    return verdict('invalid', 'chain_broken', `The blockchain failed validation at block ${proof.chainWalk.brokenAt ?? proof.block}.`, base);
-  }
+  const base = { certificateNo: number, parsed, proof: onChain.proof ?? null };
 
   const issuer = await deps.issuerTrusted(onChain.issuer);
   if (!issuer) {
@@ -248,19 +247,12 @@ export async function verifyCertificateEvidence({ ocrText = '', qrText = '' }, d
     return { verdict: 'invalid', code: 'field_mismatch', reason: `These details do not match the university's record: ${changed.map((f) => f.label).join(', ')}.`, ...base };
   }
 
-  const recomputed = sha256(degree ? degreeCanonical(degree) : view.canonical);
-  base.hash = { recomputed, onChain: onChain.certHash, match: recomputed === onChain.certHash };
+  const recomputed = documentHash(degree ? degreeCanonical(degree) : view.canonical, marks ?? []);
+  base.hash = { recomputed, onChain: onChain.docHash, match: recomputed === onChain.docHash };
   if (!base.hash.match) {
-    return { verdict: 'invalid', code: 'hash_mismatch', reason: "The university's record no longer hashes to the value on the blockchain: the record was altered.", ...base };
+    return { verdict: 'invalid', code: 'hash_mismatch', reason: "The university's record or marks no longer hash to the docHash in the smart contract: the record was altered.", ...base };
   }
-  if (onChain.marksHash && marks?.length) {
-    const marksHash = sha256(marksString(marks));
-    base.hash.marksMatch = marksHash === onChain.marksHash;
-    if (!base.hash.marksMatch) {
-      return { verdict: 'invalid', code: 'marks_hash_mismatch', reason: "The university's semester marks no longer match the hash on the blockchain: the marks were altered.", ...base };
-    }
-  }
-  if (qr && qr.hash !== onChain.certHash) {
+  if (qr && `0x${qr.hash}` !== onChain.docHash) {
     return { verdict: 'invalid', code: 'qr_hash_mismatch', reason: "The QR code's hash does not match the blockchain.", ...base };
   }
 

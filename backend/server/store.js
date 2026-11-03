@@ -32,6 +32,7 @@ const COLUMNS = {
   institutionId: 'institution_id',
   issuerAddress: 'issuer_address',
   certificateNo: 'certificate_no',
+  ipfs: 'ipfs',
 };
 
 const INSTITUTION_COLUMNS = {
