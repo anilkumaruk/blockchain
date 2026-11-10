@@ -42,6 +42,7 @@ const TABS = [
 
 import DirectChainCheck from '../components/DirectChainCheck';
 import { parseQrPayload } from '../lib/certificateView';
+import QrScanner from 'qr-scanner';
 
 export default function VerificationUI() {
   const { notify } = useToast();
@@ -318,6 +319,7 @@ function UploadTab({ onVerify, verifying }) {
   const [file, setFile] = useState(null);
   const [hashing, setHashing] = useState(false);
   const [computedHash, setComputedHash] = useState(null);
+  const [qrInfo, setQrInfo] = useState(null);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef(null);
 
@@ -325,8 +327,21 @@ function UploadTab({ onVerify, verifying }) {
     if (!f) return;
     setFile(f);
     setComputedHash(null);
+    setQrInfo(null);
     setHashing(true);
     try {
+      // For images, try to scan for a QR code first (carries the canonical hash)
+      if (f.type.startsWith('image/')) {
+        try {
+          const result = await QrScanner.scanImage(f, { returnDetailedScanResult: true });
+          if (result?.data) {
+            const parsed = parseQrPayload(result.data);
+            if (parsed) setQrInfo(parsed);
+          }
+        } catch {
+          /* no QR found — fall through to file hash */
+        }
+      }
       const hex = await realSha256Hex(f);
       setComputedHash(hex);
     } finally {
@@ -335,6 +350,21 @@ function UploadTab({ onVerify, verifying }) {
   };
 
   const handleVerify = () => {
+    if (qrInfo) {
+      // QR carries the canonical hash — use it directly (matches what the blockchain stores)
+      if (qrInfo.hash) {
+        onVerify(
+          { fileHash: `0x${qrInfo.hash}` },
+          { type: 'hash', value: `0x${qrInfo.hash}`, fileName: file?.name },
+        );
+      } else if (qrInfo.certificateNo) {
+        onVerify(
+          { credentialId: qrInfo.certificateNo },
+          { type: 'id', value: qrInfo.certificateNo, fileName: file?.name },
+        );
+      }
+      return;
+    }
     if (!computedHash) return;
     onVerify({ fileHash: computedHash }, { type: 'hash', value: computedHash, fileName: file?.name });
   };
@@ -342,6 +372,7 @@ function UploadTab({ onVerify, verifying }) {
   const clearFile = () => {
     setFile(null);
     setComputedHash(null);
+    setQrInfo(null);
   };
 
   return (
@@ -349,7 +380,7 @@ function UploadTab({ onVerify, verifying }) {
       <p className="flex flex-wrap items-center gap-1.5 text-[11px] text-ink-soft mb-4">
         <span>Upload</span>
         <ArrowRight size={10} aria-hidden="true" />
-        <span>Calculate SHA-256</span>
+        <span>Extract QR / Compute SHA-256</span>
         <ArrowRight size={10} aria-hidden="true" />
         <span>Compare with registered Credential DNA</span>
         <ArrowRight size={10} aria-hidden="true" />
@@ -377,7 +408,8 @@ function UploadTab({ onVerify, verifying }) {
           <p className="text-sm font-medium mb-1">Drop the certificate file here</p>
           <p className="text-xs text-ink-soft mb-1">or click to browse (PDF, image, etc.)</p>
           <p className="text-[11px] text-ink-soft/70">
-            Its SHA-256 is computed locally in your browser — the file is never uploaded anywhere.
+            Images are scanned for an embedded QR code (carries the canonical credential hash).
+            All processing is local — the file is never uploaded anywhere.
           </p>
           <input
             ref={inputRef}
@@ -408,24 +440,52 @@ function UploadTab({ onVerify, verifying }) {
           {hashing ? (
             <div className="flex items-center gap-2 text-sm text-ink-soft mb-4">
               <Spinner size={15} />
-              Computing SHA-256 of the file (Web Crypto API)…
+              {file?.type?.startsWith('image/')
+                ? 'Scanning for QR code and computing SHA-256…'
+                : 'Computing SHA-256 of the file (Web Crypto API)…'}
             </div>
           ) : (
-            computedHash && (
-              <div className="mb-4">
-                <p className="text-xs text-ink-soft mb-1.5">Computed document hash</p>
-                <HashChip value={computedHash} />
-              </div>
-            )
+            <>
+              {qrInfo && (
+                <div className="mb-4 p-3 rounded-md bg-teal/10 border border-teal/30">
+                  <p className="text-xs font-medium text-teal mb-1">
+                    ✓ QR code found — using canonical credential hash
+                  </p>
+                  {qrInfo.certificateNo && (
+                    <p className="text-xs text-ink-soft">
+                      Certificate No: <span className="font-mono">{qrInfo.certificateNo}</span>
+                    </p>
+                  )}
+                  {qrInfo.hash && (
+                    <div className="mt-1.5">
+                      <HashChip value={`0x${qrInfo.hash}`} />
+                    </div>
+                  )}
+                </div>
+              )}
+              {!qrInfo && computedHash && (
+                <div className="mb-4">
+                  <p className="text-xs text-ink-soft mb-1.5">Raw file SHA-256</p>
+                  <HashChip value={computedHash} />
+                  {USE_BACKEND && (
+                    <p className="text-[11px] text-amber-600 mt-1.5">
+                      ⚠ This hash is of the raw file bytes. For image certificates with an embedded QR
+                      code the system uses the QR's canonical hash instead. If verification fails, ensure
+                      the uploaded image contains the certificate QR code.
+                    </p>
+                  )}
+                </div>
+              )}
+            </>
           )}
 
           <button
             onClick={handleVerify}
-            disabled={!computedHash || verifying}
+            disabled={(!computedHash && !qrInfo) || verifying}
             className="w-full flex items-center justify-center gap-1.5 bg-teal text-white text-sm font-medium rounded-md px-4 py-2.5 hover:bg-teal/90 disabled:opacity-50"
           >
             {verifying ? <Spinner size={14} /> : <Search size={15} />}
-            Compare against registered credential fingerprint
+            {qrInfo ? 'Verify via QR credential hash' : 'Compare against registered credential fingerprint'}
           </button>
         </div>
       )}
