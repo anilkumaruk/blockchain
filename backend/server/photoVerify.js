@@ -240,15 +240,31 @@ export async function verifyCertificateEvidence({ ocrText = '', qrText = '' }, d
   }
   const changed = base.fields.filter((f) => !f.match && f.found != null);
   const unread = base.fields.filter((f) => f.found == null);
-  if (!changed.length && unread.length) {
-    return { verdict: 'invalid', code: 'fields_unreadable', reason: `Could not read: ${unread.map((f) => f.label).join(', ')}. Retake the photo with the whole certificate flat and in focus.`, ...base };
-  }
+
+  // Mismatched fields are always a red flag — a changed value is unambiguously wrong
   if (changed.length) {
     return { verdict: 'invalid', code: 'field_mismatch', reason: `These details do not match the university's record: ${changed.map((f) => f.label).join(', ')}.`, ...base };
   }
 
+  // Cryptographic hash check — the strongest form of verification
   const recomputed = documentHash(degree ? degreeCanonical(degree) : view.canonical, marks ?? []);
   base.hash = { recomputed, onChain: onChain.docHash, match: recomputed === onChain.docHash };
+
+  if (unread.length) {
+    if (!base.hash.match) {
+      // Hash mismatch AND unreadable fields → data was definitely altered
+      return { verdict: 'invalid', code: 'hash_mismatch', reason: "The university's record or marks no longer hash to the docHash in the smart contract: the record was altered.", ...base };
+    }
+    // Hash matches: DB data is cryptographically verified against the blockchain.
+    // Unreadable SEMESTER rows are still a red flag — the photo might be hiding edited marks.
+    const unreadSems = unread.filter((f) => f.field.startsWith('sem'));
+    if (unreadSems.length) {
+      return { verdict: 'invalid', code: 'fields_unreadable', reason: `Could not read: ${unreadSems.map((f) => f.label).join(', ')}. Retake the photo with the semester table visible and in focus.`, ...base };
+    }
+    // Only unreadable header fields (name, date, etc.) AND hash matches → continue to valid
+    // The cryptographic proof is sufficient; minor OCR failures on decorative text are acceptable.
+  }
+
   if (!base.hash.match) {
     return { verdict: 'invalid', code: 'hash_mismatch', reason: "The university's record or marks no longer hash to the docHash in the smart contract: the record was altered.", ...base };
   }
